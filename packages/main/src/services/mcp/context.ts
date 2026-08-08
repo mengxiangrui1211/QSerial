@@ -108,28 +108,32 @@ export function removeBuffer(id: string): void {
   buffers.delete(id);
 }
 
-// ==================== 串行写锁（同一连接排队） ====================
+// ==================== 连接级互斥锁（同一连接排队） ====================
 
 const writeLocks = new Map<string, Promise<void>>();
 
-export async function acquireWriteLock(id: string): Promise<void> {
+/** 获取连接锁,返回释放函数。串口是单工逐字节通道,写、等待、读缓冲区必须严格串行。 */
+export async function acquireWriteLock(id: string): Promise<() => void> {
   const prev = writeLocks.get(id) || Promise.resolve();
-  let release: () => void;
-  const next = new Promise<void>((r) => {
+  let release!: () => void;
+  const gate = new Promise<void>((r) => {
     release = r;
   });
+  // 队列尾:上一个持有者释放后 gate 才 settle,下一个等待者才能拿到锁
   writeLocks.set(
     id,
-    prev.then(() => next)
+    prev.then(() => gate)
   );
   await prev;
-  (next as Promise<void> & { _release?: () => void })._release = release!;
+  return release;
 }
 
-export function releaseWriteLock(id: string): void {
-  const lock = writeLocks.get(id) as (Promise<void> & { _release?: () => void }) | undefined;
-  if (lock?._release) {
-    lock._release();
+export async function withConnectionLock<T>(id: string, fn: () => Promise<T>): Promise<T> {
+  const release = await acquireWriteLock(id);
+  try {
+    return await fn();
+  } finally {
+    release();
   }
 }
 
@@ -149,15 +153,24 @@ export function sleep(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
 }
 
+/** ANSI CSI 转义序列(颜色、光标控制等),ESC 用 fromCharCode 构造以避免 no-control-regex */
+const ANSI_ESCAPE_RE = new RegExp(String.fromCharCode(27) + '\\[[0-9;?]*[ -/]*[@-~]', 'g');
+
+/** 去掉 ANSI 转义序列,用于提示符/模式匹配 */
+export function stripAnsi(text: string): string {
+  return text.replace(ANSI_ESCAPE_RE, '');
+}
+
 export function matchPattern(text: string, pattern: string, isRegex: boolean): boolean {
+  const normalized = stripAnsi(text);
   if (isRegex) {
     try {
-      return new RegExp(pattern, 'i').test(text);
+      return new RegExp(pattern, 'i').test(normalized);
     } catch {
-      return text.toLowerCase().includes(pattern.toLowerCase());
+      return normalized.toLowerCase().includes(pattern.toLowerCase());
     }
   }
-  return text.toLowerCase().includes(pattern.toLowerCase());
+  return normalized.toLowerCase().includes(pattern.toLowerCase());
 }
 
 export async function waitPattern(
@@ -166,7 +179,12 @@ export async function waitPattern(
   timeout: number,
   isRegex = false
 ): Promise<{ matched: boolean; output: string }> {
-  const deadline = Date.now() + timeout * 1000;
+  // 空闲超时机制:有新数据就顺延等待,容忍设备主动输出(如内核日志),
+  // 但总等待时间不超过原始超时的两倍,避免持续输出导致无限挂起
+  const timeoutMs = timeout * 1000;
+  const startedAt = Date.now();
+  const maxWaitMs = timeoutMs * 2;
+  let lastActivityAt = startedAt;
   let allOutput = '';
   let wakeup: (() => void) | null = null;
   let unsub: (() => void) | null = null;
@@ -186,16 +204,20 @@ export async function waitPattern(
   };
 
   try {
-    while (Date.now() < deadline) {
+    while (Date.now() - lastActivityAt < timeoutMs && Date.now() - startedAt < maxWaitMs) {
       const chunk = consumeBuffer(id).toString('utf-8');
       if (chunk) {
         allOutput += chunk;
+        lastActivityAt = Date.now();
         if (matchPattern(allOutput, pattern, isRegex)) {
           cleanup();
           return { matched: true, output: allOutput };
         }
       }
-      const remaining = deadline - Date.now();
+      const remaining = Math.min(
+        timeoutMs - (Date.now() - lastActivityAt),
+        maxWaitMs - (Date.now() - startedAt)
+      );
       if (remaining <= 0) break;
       await Promise.race([
         new Promise<void>((r) => {
@@ -217,7 +239,10 @@ export async function waitForAnyPattern(
   patterns: { pattern: string; isRegex: boolean }[],
   timeout: number
 ): Promise<{ matched: boolean; index: number; output: string }> {
-  const deadline = Date.now() + timeout * 1000;
+  const timeoutMs = timeout * 1000;
+  const startedAt = Date.now();
+  const maxWaitMs = timeoutMs * 2;
+  let lastActivityAt = startedAt;
   let allOutput = '';
   let wakeup: (() => void) | null = null;
   let unsub: (() => void) | null = null;
@@ -237,10 +262,11 @@ export async function waitForAnyPattern(
   };
 
   try {
-    while (Date.now() < deadline) {
+    while (Date.now() - lastActivityAt < timeoutMs && Date.now() - startedAt < maxWaitMs) {
       const chunk = consumeBuffer(id).toString('utf-8');
       if (chunk) {
         allOutput += chunk;
+        lastActivityAt = Date.now();
         for (let i = 0; i < patterns.length; i++) {
           if (matchPattern(allOutput, patterns[i].pattern, patterns[i].isRegex)) {
             cleanup();
@@ -248,7 +274,10 @@ export async function waitForAnyPattern(
           }
         }
       }
-      const remaining = deadline - Date.now();
+      const remaining = Math.min(
+        timeoutMs - (Date.now() - lastActivityAt),
+        maxWaitMs - (Date.now() - startedAt)
+      );
       if (remaining <= 0) break;
       await Promise.race([
         new Promise<void>((r) => {
@@ -288,6 +317,46 @@ export async function waitForData(id: string, timeoutMs: number): Promise<void> 
   }
 }
 
+/** 持续消费输出,直到连续 inactivityMs 没有新数据(或达到 maxTotalMs 上限)。 */
+export async function collectOutputUntilIdle(
+  id: string,
+  inactivityMs: number,
+  maxTotalMs: number
+): Promise<Buffer> {
+  const startedAt = Date.now();
+  let lastActivityAt = startedAt;
+  const chunks: Buffer[] = [];
+  let wakeup: (() => void) | null = null;
+  const conn = ConnectionFactory.get(id);
+  const unsub = conn?.onData(() => {
+    wakeup?.();
+  });
+  try {
+    while (Date.now() - lastActivityAt < inactivityMs && Date.now() - startedAt < maxTotalMs) {
+      const chunk = consumeBuffer(id);
+      if (chunk.length > 0) {
+        chunks.push(chunk);
+        lastActivityAt = Date.now();
+        continue;
+      }
+      const remaining = Math.min(
+        inactivityMs - (Date.now() - lastActivityAt),
+        maxTotalMs - (Date.now() - startedAt)
+      );
+      if (remaining <= 0) break;
+      await Promise.race([
+        new Promise<void>((r) => {
+          wakeup = r;
+        }),
+        sleep(Math.min(remaining, 200)),
+      ]);
+    }
+  } finally {
+    if (unsub) unsub();
+  }
+  return Buffer.concat(chunks);
+}
+
 // ==================== 状态分析 ====================
 
 export interface TerminalState {
@@ -313,7 +382,8 @@ export function analyzeState(output: string, connectionState: string): TerminalS
     return { state: 'idle', detected_prompts: [], details: '缓冲区为空，等待设备输出' };
   }
 
-  const tail = output.slice(-1024).toLowerCase();
+  const clean = stripAnsi(output);
+  const tail = clean.slice(-1024).toLowerCase();
   const detected: string[] = [];
 
   if (/password[:\s]/i.test(tail)) {
@@ -325,7 +395,7 @@ export function analyzeState(output: string, connectionState: string): TerminalS
   }
 
   const lastLine = (
-    output
+    clean
       .split('\n')
       .filter((l) => l.trim())
       .pop() || ''

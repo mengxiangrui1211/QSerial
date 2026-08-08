@@ -119,24 +119,26 @@ export const connAdvancedHandlers: Record<string, ToolHandler> = {
       },
     ];
 
-    ctx.ensureBuffer(probeId);
-    ctx.clearBuffer(probeId);
-    probeConn.write(Buffer.from('AT\n', 'utf-8'));
-    appendHistory(probeId, 'send', 'AT\n');
-    await ctx.sleep(3000);
-    const probeOutput = ctx.consumeBuffer(probeId).toString('utf-8');
-    if (probeOutput) appendHistory(probeId, 'recv', probeOutput);
-    const matches = knownDevices
-      .filter((d) => d.patterns.some((p) => probeOutput.includes(p)))
-      .map((d) => ({
-        device: d.name,
-        confidence: d.patterns.filter((p) => probeOutput.includes(p)).length / d.patterns.length,
-        baud_hint: d.baud_hint,
-      }));
-    matches.sort((a, b) => b.confidence - a.confidence);
-    return matches.length > 0
-      ? formatOk({ best_match: matches[0], all_matches: matches.slice(0, 3) })
-      : formatOk({ device: 'unknown', confidence: 0, output_sample: probeOutput.slice(0, 300) });
+    return ctx.withConnectionLock(probeId, async () => {
+      ctx.ensureBuffer(probeId);
+      ctx.clearBuffer(probeId);
+      probeConn.write(Buffer.from('AT\n', 'utf-8'));
+      appendHistory(probeId, 'send', 'AT\n');
+      await ctx.sleep(3000);
+      const probeOutput = ctx.consumeBuffer(probeId).toString('utf-8');
+      if (probeOutput) appendHistory(probeId, 'recv', probeOutput);
+      const matches = knownDevices
+        .filter((d) => d.patterns.some((p) => probeOutput.includes(p)))
+        .map((d) => ({
+          device: d.name,
+          confidence: d.patterns.filter((p) => probeOutput.includes(p)).length / d.patterns.length,
+          baud_hint: d.baud_hint,
+        }));
+      matches.sort((a, b) => b.confidence - a.confidence);
+      return matches.length > 0
+        ? formatOk({ best_match: matches[0], all_matches: matches.slice(0, 3) })
+        : formatOk({ device: 'unknown', confidence: 0, output_sample: probeOutput.slice(0, 300) });
+    });
   },
 
   'conn.analyze.report': async (args) => {
@@ -177,112 +179,116 @@ export const connAdvancedHandlers: Record<string, ToolHandler> = {
     if (conn.state !== ConnectionState.CONNECTED) {
       return `错误: 连接未就绪（当前状态：${conn.state}）`;
     }
-    ctx.ensureBuffer(id);
+    return ctx.withConnectionLock(id, async () => {
+      ctx.ensureBuffer(id);
 
-    const steps: string[] = [];
-    const addStep = (s: string) => {
-      if (debug) steps.push(s);
-    };
+      const steps: string[] = [];
+      const addStep = (s: string) => {
+        if (debug) steps.push(s);
+      };
 
-    addStep(`[1/5] 等待登录提示 (regex: "${loginPrompt}", timeout=${timeout}s)...`);
+      addStep(`[1/5] 等待登录提示 (regex: "${loginPrompt}", timeout=${timeout}s)...`);
 
-    const loginResult = await ctx.waitPattern(id, loginPrompt, timeout, true);
-    if (!loginResult.matched) {
-      try {
-        const lctx2 = loginResult.output.slice(-500);
-        const lchoice = await requestSampling(
-          'Login prompt not matched on device',
-          'Device output: ' + lctx2 + ' | Pattern: ' + loginPrompt,
-          ['retry', 'send_anyway', 'abort'],
-          15000
-        );
-        if (lchoice === 'retry')
-          return formatError('SAMPLING_RETRY', 'AI suggests retry. Output: ' + lctx2);
-        if (lchoice === 'abort') return formatError('SAMPLING_ABORT', 'AI aborted login');
-      } catch {
-        /* sampling timeout */
+      const loginResult = await ctx.waitPattern(id, loginPrompt, timeout, true);
+      if (!loginResult.matched) {
+        try {
+          const lctx2 = loginResult.output.slice(-500);
+          const lchoice = await requestSampling(
+            'Login prompt not matched on device',
+            'Device output: ' + lctx2 + ' | Pattern: ' + loginPrompt,
+            ['retry', 'send_anyway', 'abort'],
+            15000
+          );
+          if (lchoice === 'retry')
+            return formatError('SAMPLING_RETRY', 'AI suggests retry. Output: ' + lctx2);
+          if (lchoice === 'abort') return formatError('SAMPLING_ABORT', 'AI aborted login');
+        } catch {
+          /* sampling timeout */
+        }
+        if (debug) {
+          return [
+            ...steps,
+            '[失败] 超时未匹配登录提示',
+            `当前输出 (500B): ${loginResult.output.slice(-500)}`,
+            '提示: 尝试先用 connection_read (consume=false) 查看终端内容，确认提示符格式',
+          ].join('\n');
+        }
+        return `错误: 超时未检测到登录提示 "${loginPrompt}"。当前内容:\n${loginResult.output.slice(-500)}`;
       }
-      if (debug) {
-        return [
-          ...steps,
-          '[失败] 超时未匹配登录提示',
-          `当前输出 (500B): ${loginResult.output.slice(-500)}`,
-          '提示: 尝试先用 connection_read (consume=false) 查看终端内容，确认提示符格式',
-        ].join('\n');
-      }
-      return `错误: 超时未检测到登录提示 "${loginPrompt}"。当前内容:\n${loginResult.output.slice(-500)}`;
-    }
-    addStep(`[2/5] 检测到登录提示，发送用户名 "${username}" (输出 ${loginResult.output.length}B)`);
-
-    conn.write(Buffer.from(username + '\n', 'utf-8'));
-    await ctx.sleep(300);
-    ctx.clearBuffer(id);
-
-    if (noPassword) {
       addStep(
-        `[3/4] 跳过密码（no_password=true），等待 Shell 提示符 (regex: "${shellPrompt}", timeout=${timeout}s)...`
+        `[2/5] 检测到登录提示，发送用户名 "${username}" (输出 ${loginResult.output.length}B)`
       );
-      const shellResult2 = await ctx.waitPattern(id, shellPrompt, timeout, true);
-      const output2 = ctx.consumeBuffer(id).toString('utf-8');
-      if (shellResult2.matched) {
-        const state2 = ctx.analyzeState(output2, conn.state);
-        addStep(`[完成] 登录成功（无密码），Shell 类型: ${state2.shell_type || 'detected'}`);
-        return steps.join('\n') + `\n\n登录成功。\n${output2.slice(-300)}`;
+
+      conn.write(Buffer.from(username + '\n', 'utf-8'));
+      await ctx.sleep(300);
+      ctx.clearBuffer(id);
+
+      if (noPassword) {
+        addStep(
+          `[3/4] 跳过密码（no_password=true），等待 Shell 提示符 (regex: "${shellPrompt}", timeout=${timeout}s)...`
+        );
+        const shellResult2 = await ctx.waitPattern(id, shellPrompt, timeout, true);
+        const output2 = ctx.consumeBuffer(id).toString('utf-8');
+        if (shellResult2.matched) {
+          const state2 = ctx.analyzeState(output2, conn.state);
+          addStep(`[完成] 登录成功（无密码），Shell 类型: ${state2.shell_type || 'detected'}`);
+          return steps.join('\n') + `\n\n登录成功。\n${output2.slice(-300)}`;
+        }
+        addStep('[完成] 凭据已发送（Shell 提示未检测到，可能已登录）');
+        return steps.join('\n') + `\n\n${output2.slice(-500)}`;
       }
+
+      addStep(
+        `[3/5] 等待密码提示或 Shell 提示 (regex: "${passwordPrompt}" / "${shellPrompt}", timeout=${timeout}s)...`
+      );
+      const postUserResult = await ctx.waitForAnyPattern(
+        id,
+        [
+          { pattern: passwordPrompt, isRegex: true },
+          { pattern: shellPrompt, isRegex: true },
+        ],
+        timeout
+      );
+
+      if (postUserResult.matched && postUserResult.index === 1) {
+        const remaining = ctx.consumeBuffer(id).toString('utf-8');
+        const output = postUserResult.output + remaining;
+        const state = ctx.analyzeState(output, conn.state);
+        addStep('[跳过] 设备直接进入 Shell，未出现密码提示（无密码设备）');
+        addStep(`[完成] 登录成功（无密码设备），Shell 类型: ${state.shell_type || 'detected'}`);
+        return steps.join('\n') + `\n\n登录成功（检测到无密码设备）。\n${output.slice(-300)}`;
+      }
+
+      if (!postUserResult.matched) {
+        if (debug) {
+          return [
+            ...steps,
+            '[失败] 超时未匹配密码提示或 Shell 提示',
+            '用户名已发送，但未检测到密码提示或 Shell 提示',
+            `当前输出 (500B): ${postUserResult.output.slice(-500)}`,
+            '提示: 检查用户名是否正确；或使用 no_password=true 跳过密码步骤；或使用 connection_read (consume=false) 查看终端',
+          ].join('\n');
+        }
+        return `错误: 超时未检测到密码提示或 Shell 提示。当前内容:\n${postUserResult.output.slice(-500)}`;
+      }
+
+      addStep(`[4/5] 检测到密码提示，发送密码 (输出 ${postUserResult.output.length}B)`);
+      conn.write(Buffer.from(password + '\n', 'utf-8'));
+      await ctx.sleep(300);
+
+      addStep(`[5/5] 等待 Shell 提示符 (regex: "${shellPrompt}", timeout=${timeout}s)...`);
+      const shellResult = await ctx.waitPattern(id, shellPrompt, timeout, true);
+      const output = ctx.consumeBuffer(id).toString('utf-8');
+
+      if (shellResult.matched) {
+        const state = ctx.analyzeState(output, conn.state);
+        addStep(`[完成] 登录成功，Shell 类型: ${state.shell_type || 'detected'}`);
+        return steps.join('\n') + `\n\n登录成功。\n${output.slice(-300)}`;
+      }
+
       addStep('[完成] 凭据已发送（Shell 提示未检测到，可能已登录）');
-      return steps.join('\n') + `\n\n${output2.slice(-500)}`;
-    }
-
-    addStep(
-      `[3/5] 等待密码提示或 Shell 提示 (regex: "${passwordPrompt}" / "${shellPrompt}", timeout=${timeout}s)...`
-    );
-    const postUserResult = await ctx.waitForAnyPattern(
-      id,
-      [
-        { pattern: passwordPrompt, isRegex: true },
-        { pattern: shellPrompt, isRegex: true },
-      ],
-      timeout
-    );
-
-    if (postUserResult.matched && postUserResult.index === 1) {
-      const remaining = ctx.consumeBuffer(id).toString('utf-8');
-      const output = postUserResult.output + remaining;
-      const state = ctx.analyzeState(output, conn.state);
-      addStep('[跳过] 设备直接进入 Shell，未出现密码提示（无密码设备）');
-      addStep(`[完成] 登录成功（无密码设备），Shell 类型: ${state.shell_type || 'detected'}`);
-      return steps.join('\n') + `\n\n登录成功（检测到无密码设备）。\n${output.slice(-300)}`;
-    }
-
-    if (!postUserResult.matched) {
-      if (debug) {
-        return [
-          ...steps,
-          '[失败] 超时未匹配密码提示或 Shell 提示',
-          '用户名已发送，但未检测到密码提示或 Shell 提示',
-          `当前输出 (500B): ${postUserResult.output.slice(-500)}`,
-          '提示: 检查用户名是否正确；或使用 no_password=true 跳过密码步骤；或使用 connection_read (consume=false) 查看终端',
-        ].join('\n');
-      }
-      return `错误: 超时未检测到密码提示或 Shell 提示。当前内容:\n${postUserResult.output.slice(-500)}`;
-    }
-
-    addStep(`[4/5] 检测到密码提示，发送密码 (输出 ${postUserResult.output.length}B)`);
-    conn.write(Buffer.from(password + '\n', 'utf-8'));
-    await ctx.sleep(300);
-
-    addStep(`[5/5] 等待 Shell 提示符 (regex: "${shellPrompt}", timeout=${timeout}s)...`);
-    const shellResult = await ctx.waitPattern(id, shellPrompt, timeout, true);
-    const output = ctx.consumeBuffer(id).toString('utf-8');
-
-    if (shellResult.matched) {
-      const state = ctx.analyzeState(output, conn.state);
-      addStep(`[完成] 登录成功，Shell 类型: ${state.shell_type || 'detected'}`);
-      return steps.join('\n') + `\n\n登录成功。\n${output.slice(-300)}`;
-    }
-
-    addStep('[完成] 凭据已发送（Shell 提示未检测到，可能已登录）');
-    return steps.join('\n') + `\n\n${output.slice(-500)}`;
+      return steps.join('\n') + `\n\n${output.slice(-500)}`;
+    });
   },
 
   'conn.script.run': async (args) => {
@@ -296,66 +302,68 @@ export const connAdvancedHandlers: Record<string, ToolHandler> = {
     if (conn2.state !== ConnectionState.CONNECTED)
       return formatError('CONN_NOT_CONNECTED', 'not connected');
 
-    const results: Array<Record<string, unknown>> = [];
-    for (let i = 0; i < steps.length; i++) {
-      const step = steps[i];
-      const timeout2: number = typeof step.timeout_ms === 'number' ? step.timeout_ms : 15000;
-      if (step.delay_ms) await ctx.sleep(step.delay_ms as number);
-      ctx.ensureBuffer(rsid);
-      ctx.clearBuffer(rsid);
-      const t1 = Date.now();
-      const sendStr: string = String(step.send || '');
-      const data = sendStr.endsWith('\n') ? sendStr : sendStr + '\n';
-      conn2.write(Buffer.from(data, 'utf-8'));
-      appendHistory(rsid, 'send', data);
-      const pats = [{ pattern: '[#$>]\\s', isRegex: true }];
-      await ctx.waitForAnyPattern(rsid, pats, Math.ceil(timeout2 / 1000));
-      const output2 = ctx.consumeBuffer(rsid).toString('utf-8');
-      if (output2) appendHistory(rsid, 'recv', output2);
-      sendMCPNotification('script/step_completed', {
-        connection_id: rsid,
-        step: i,
-        total: steps.length,
-        ok: true,
-      });
-      const xp: string = (step.expect as string) || '';
-      const isOk = !xp || output2.includes(xp);
-      if (!isOk && xp) {
-        try {
-          const schoice = await requestSampling(
-            'Script step ' + (i + 1) + ' failed: expected "' + xp + '" not found',
-            'Command: ' + String(step.send || '') + ' | Output: ' + output2.slice(0, 400),
-            ['retry', 'skip', 'abort'],
-            15000
-          );
-          if (schoice === 'retry') {
-            i--;
-            continue;
+    return ctx.withConnectionLock(rsid, async () => {
+      const results: Array<Record<string, unknown>> = [];
+      for (let i = 0; i < steps.length; i++) {
+        const step = steps[i];
+        const timeout2: number = typeof step.timeout_ms === 'number' ? step.timeout_ms : 15000;
+        if (step.delay_ms) await ctx.sleep(step.delay_ms as number);
+        ctx.ensureBuffer(rsid);
+        ctx.clearBuffer(rsid);
+        const t1 = Date.now();
+        const sendStr: string = String(step.send || '');
+        const data = sendStr.endsWith('\n') ? sendStr : sendStr + '\n';
+        conn2.write(Buffer.from(data, 'utf-8'));
+        appendHistory(rsid, 'send', data);
+        const pats = [{ pattern: '[#$>]\\s', isRegex: true }];
+        await ctx.waitForAnyPattern(rsid, pats, Math.ceil(timeout2 / 1000));
+        const output2 = ctx.consumeBuffer(rsid).toString('utf-8');
+        if (output2) appendHistory(rsid, 'recv', output2);
+        sendMCPNotification('script/step_completed', {
+          connection_id: rsid,
+          step: i,
+          total: steps.length,
+          ok: true,
+        });
+        const xp: string = (step.expect as string) || '';
+        const isOk = !xp || output2.includes(xp);
+        if (!isOk && xp) {
+          try {
+            const schoice = await requestSampling(
+              'Script step ' + (i + 1) + ' failed: expected "' + xp + '" not found',
+              'Command: ' + String(step.send || '') + ' | Output: ' + output2.slice(0, 400),
+              ['retry', 'skip', 'abort'],
+              15000
+            );
+            if (schoice === 'retry') {
+              i--;
+              continue;
+            }
+            if (schoice === 'abort')
+              return formatError('SCRIPT_ABORTED', 'AI aborted at step ' + (i + 1));
+          } catch {
+            /* sampling timeout */
           }
-          if (schoice === 'abort')
-            return formatError('SCRIPT_ABORTED', 'AI aborted at step ' + (i + 1));
-        } catch {
-          /* sampling timeout */
+          results.push({
+            step: i,
+            description: (step.description as string) || 'step ' + (i + 1),
+            ok: false,
+            output: output2.slice(0, 2000),
+            duration_ms: Date.now() - t1,
+            error: 'expect not matched',
+          });
+          continue;
         }
         results.push({
           step: i,
           description: (step.description as string) || 'step ' + (i + 1),
-          ok: false,
+          ok: true,
           output: output2.slice(0, 2000),
           duration_ms: Date.now() - t1,
-          error: 'expect not matched',
         });
-        continue;
       }
-      results.push({
-        step: i,
-        description: (step.description as string) || 'step ' + (i + 1),
-        ok: true,
-        output: output2.slice(0, 2000),
-        duration_ms: Date.now() - t1,
-      });
-    }
-    return formatOk({ completed: results.length, total: steps.length, success: true, results });
+      return formatOk({ completed: results.length, total: steps.length, success: true, results });
+    });
   },
 
   'conn.share': async (args, toolCtx) => {

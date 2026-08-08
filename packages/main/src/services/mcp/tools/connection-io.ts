@@ -31,8 +31,7 @@ export const connIOHandlers: Record<string, ToolHandler> = {
     if (conn.state !== ConnectionState.CONNECTED) {
       return `错误: 连接 ${id} 未就绪（当前状态：${conn.state}）`;
     }
-    await ctx.acquireWriteLock(id);
-    try {
+    return ctx.withConnectionLock(id, async () => {
       ctx.ensureBuffer(id);
 
       if (args.wait_before) {
@@ -49,15 +48,15 @@ export const connIOHandlers: Record<string, ToolHandler> = {
 
       conn.write(Buffer.from(data, 'utf-8'));
       const responseTimeout = (args.response_timeout_ms as number) || 2000;
-      await ctx.waitForData(id, responseTimeout);
-      const output = ctx.consumeBuffer(id).toString('utf-8');
+      // 有新数据就继续等待,直到连续 responseTimeout 无新输出(上限 3 倍)
+      const output = (
+        await ctx.collectOutputUntilIdle(id, responseTimeout, responseTimeout * 3)
+      ).toString('utf-8');
       const meta = `sent=${data.length}B, replied=${output.length}B, ts=${Date.now()}`;
       return output
         ? `${output}\n\n[${meta}]`
         : `已发送 (${data.length} 字符)，无立即回显 [${meta}]`;
-    } finally {
-      ctx.releaseWriteLock(id);
-    }
+    });
   },
 
   'conn.data.write_hex': async (args) => {
@@ -72,14 +71,16 @@ export const connIOHandlers: Record<string, ToolHandler> = {
     if (conn.state !== ConnectionState.CONNECTED) {
       return `错误: 连接 ${id} 未就绪（当前状态：${conn.state}）`;
     }
-    ctx.ensureBuffer(id);
-    conn.writeHex(hex);
-    await ctx.waitForData(id, 2000);
-    const output = ctx.consumeBuffer(id).toString('utf-8');
-    const meta = `sent=${hex.length / 2}B hex, replied=${output.length}B, ts=${Date.now()}`;
-    return output
-      ? `${output}\n\n[${meta}]`
-      : `已发送 (${hex.length / 2} 字节)，无立即回显 [${meta}]`;
+    return ctx.withConnectionLock(id, async () => {
+      ctx.ensureBuffer(id);
+      conn.writeHex(hex);
+      await ctx.waitForData(id, 2000);
+      const output = ctx.consumeBuffer(id).toString('utf-8');
+      const meta = `sent=${hex.length / 2}B hex, replied=${output.length}B, ts=${Date.now()}`;
+      return output
+        ? `${output}\n\n[${meta}]`
+        : `已发送 (${hex.length / 2} 字节)，无立即回显 [${meta}]`;
+    });
   },
 
   'conn.data.read': async (args) => {
@@ -93,14 +94,16 @@ export const connIOHandlers: Record<string, ToolHandler> = {
     const totalBefore = ctx.bufferSize(id);
 
     if (consume) {
-      if (maxBytes === 0) {
-        ctx.clearBuffer(id);
-        const meta = `cleared, total_before=${totalBefore}, ts=${Date.now()}`;
-        return `(已清空 ${totalBefore}B) [${meta}]`;
-      }
-      const output = ctx.consumeBuffer(id).toString('utf-8');
-      const meta = `bytes=${output.length}, total_before_read=${totalBefore}, ts=${Date.now()}`;
-      return output ? `${output}\n[${meta}]` : `(无新输出) [${meta}]`;
+      return ctx.withConnectionLock(id, async () => {
+        if (maxBytes === 0) {
+          ctx.clearBuffer(id);
+          const meta = `cleared, total_before=${totalBefore}, ts=${Date.now()}`;
+          return `(已清空 ${totalBefore}B) [${meta}]`;
+        }
+        const output = ctx.consumeBuffer(id).toString('utf-8');
+        const meta = `bytes=${output.length}, total_before_read=${totalBefore}, ts=${Date.now()}`;
+        return output ? `${output}\n[${meta}]` : `(无新输出) [${meta}]`;
+      });
     } else {
       const output = ctx.peekBuffer(id, maxBytes).toString('utf-8');
       const meta = `shown=${output.length}, buffer_total=${totalBefore}, ts=${Date.now()}`;
@@ -119,7 +122,9 @@ export const connIOHandlers: Record<string, ToolHandler> = {
     if (!conn) return `错误: 找不到连接 ${id}`;
     ctx.ensureBuffer(id);
 
-    const result = await ctx.waitPattern(id, pattern, timeout, isRegex);
+    const result = await ctx.withConnectionLock(id, () =>
+      ctx.waitPattern(id, pattern, timeout, isRegex)
+    );
 
     if (result.matched) {
       return `${result.output}\n[匹配 "${pattern}" (${isRegex ? 'regex' : 'substr'}), 耗时=${result.output.length}B]`;
@@ -150,8 +155,7 @@ export const connIOHandlers: Record<string, ToolHandler> = {
     if (conn.state !== ConnectionState.CONNECTED)
       return formatError('CONN_NOT_CONNECTED', 'not connected');
 
-    await ctx.acquireWriteLock(id);
-    try {
+    return ctx.withConnectionLock(id, async () => {
       ctx.ensureBuffer(id);
       ctx.clearBuffer(id);
 
@@ -207,9 +211,7 @@ export const connIOHandlers: Record<string, ToolHandler> = {
           ? { parsed: { at_result: atParsed.result, at_fields: atParsed.fields } }
           : {}),
       });
-    } finally {
-      ctx.releaseWriteLock(id);
-    }
+    });
   },
 
   'conn.data.history': async (args) => {
@@ -320,8 +322,7 @@ export const connIOHandlers: Record<string, ToolHandler> = {
     try {
       const timeout = (args.timeout as number) || 10;
       const retries = (args.retries as number) || 10;
-      await ctx.acquireWriteLock(id);
-      try {
+      await ctx.withConnectionLock(id, async () => {
         await xmodemSend(
           (data) => conn.write(data),
           readByte,
@@ -329,9 +330,7 @@ export const connIOHandlers: Record<string, ToolHandler> = {
           protocol as 'xmodem' | 'ymodem',
           { timeout, retries }
         );
-      } finally {
-        ctx.releaseWriteLock(id);
-      }
+      });
       const meta = `file=${localPath}, size=${fileData.length}B, protocol=${protocol}, ts=${Date.now()}`;
       return `文件已发送: ${localPath} (${fileData.length} 字节, ${protocol})\n[${meta}]`;
     } catch (err) {
@@ -364,8 +363,7 @@ export const connIOHandlers: Record<string, ToolHandler> = {
     const remotePath = (args.remote_path as string) || undefined;
     const writeCmd = (args.write_cmd as string) || 'echo';
 
-    await ctx.acquireWriteLock(id);
-    try {
+    return ctx.withConnectionLock(id, async () => {
       ctx.ensureBuffer(id);
       let totalWritten = 0;
       const MAX_CHUNK = Math.min(chunkSize, 256);
@@ -406,8 +404,6 @@ export const connIOHandlers: Record<string, ToolHandler> = {
         remote_path: remotePath || '(stdout)',
         message: `Written ${lines.length} lines to ${remotePath || 'device stdout'}`,
       });
-    } finally {
-      ctx.releaseWriteLock(id);
-    }
+    });
   },
 };
