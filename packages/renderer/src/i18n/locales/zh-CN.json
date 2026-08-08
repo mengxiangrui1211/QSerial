@@ -1,8 +1,8 @@
 {
-  "app": {
-    "name": "QSerial",
-    "version": "v0.3.0"
-  },
+ "app": {
+  "name": "QSerial",
+  "version": "v1.1.0"
+ },
   "menu": {
     "file": "文件(F)",
     "edit": "编辑(E)",
