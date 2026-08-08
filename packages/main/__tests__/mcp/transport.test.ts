@@ -272,6 +272,25 @@ describe('MCP auth', () => {
     expect(sessionId.length).toBeGreaterThan(0);
   });
 
+  it('accepts session-based /messages without repeating the token', async () => {
+    const port = await startServer('secret');
+    // 握手时通过 ?token= 完成认证,后续 POST /messages 不应再要求携带 token
+    const { client, sessionId } = await openSse(port, 'secret');
+
+    const res = await post(port, '/messages?sessionId=' + sessionId, {
+      jsonrpc: '2.0',
+      id: 1,
+      method: 'initialize',
+      params: {},
+    });
+    expect(res.status).toBe(202);
+
+    const frame = await client.nextFrame();
+    const msg = JSON.parse(frame.data);
+    expect(msg.id).toBe(1);
+    expect(msg.result.serverInfo.name).toBe('qserial-mcp');
+  });
+
   it('rejects /mcp without a token', async () => {
     const port = await startServer('secret');
     const res = await post(port, '/mcp', {

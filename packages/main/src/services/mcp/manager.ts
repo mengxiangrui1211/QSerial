@@ -1115,11 +1115,12 @@ export async function startMcpServer(
 
     // SSE 消息端点:POST 携带 JSON-RPC 请求,响应经 SSE 流返回,POST 本身只确认 202
     if (req.method === 'POST' && urlPath === '/messages') {
-      if (ctx.mcpAuthPassword && !checkAuth(req, res)) return;
       const sessionId =
         new URLSearchParams((req.url || '').split('?')[1] || '').get('sessionId') || '';
       const session = sseSessions.get(sessionId);
       if (!session) {
+        // 无会话时回退到独立请求鉴权(兼容直接调用 /messages 的客户端)
+        if (ctx.mcpAuthPassword && !checkAuth(req, res)) return;
         res.writeHead(404, { 'Content-Type': 'application/json' });
         res.end(
           JSON.stringify({
