@@ -396,27 +396,31 @@ app.on('window-all-closed', () => {
   }
 });
 
-// 应用退出前清理 - 使用动态 import 避免启动时加载
-app.on('before-quit', () => {
-  // NFS 清理（同步，确保 WinNFSd 进程终止）
-  import('./services/nfs/manager.js').then((m) => m.destroyNfsManager()).catch(() => {});
-  // TFTP 清理
-  import('./services/tftp/manager.js').then((m) => m.destroyTftpManager()).catch(() => {});
-  // FTP 清理
-  import('./services/ftp/manager.js').then((m) => m.destroyFtpManager()).catch(() => {});
-});
+// 应用退出前清理 - 使用 event.preventDefault() 确保异步清理完成后再退出
+let cleanupDone = false;
 
-app.on('before-quit', async () => {
-  await import('./services/mcp/manager.js').then((m) => m.destroyMcpManager()).catch(() => {});
-});
+app.on('before-quit', async (event) => {
+  if (cleanupDone) return;
+  event.preventDefault();
 
-app.on('before-quit', async () => {
   try {
+    // NFS 清理（同步，确保 WinNFSd 进程终止）
+    await import('./services/nfs/manager.js').then((m) => m.destroyNfsManager()).catch(() => {});
+    // TFTP 清理
+    await import('./services/tftp/manager.js').then((m) => m.destroyTftpManager()).catch(() => {});
+    // FTP 清理
+    await import('./services/ftp/manager.js').then((m) => m.destroyFtpManager()).catch(() => {});
+    // MCP 清理
+    await import('./services/mcp/manager.js').then((m) => m.destroyMcpManager()).catch(() => {});
+    // 连接清理
     const { ConnectionFactory } = await import('./services/connection/factory.js');
     await ConnectionFactory.destroyAll();
   } catch (error) {
-    console.error('Error cleaning up connections:', error);
+    console.error('Error cleaning up before quit:', error);
   }
+
+  cleanupDone = true;
+  app.quit();
 });
 
 // 监控 GPU 进程和子进程崩溃

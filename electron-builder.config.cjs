@@ -20,7 +20,8 @@ module.exports = {
       to: 'node_modules/@qserial/shared',
       filter: ['dist/**/*', 'package.json'],
     },
-    // 鏉╂劘顢戦弮鏈电贩鐠ф牗妲х亸鍕剁礄閻?scripts/gen-deps-mapping.cjs 閼奉亜濮╅悽鐔稿灇閿?    // 闁插秵鏌婇悽鐔稿灇: node scripts/gen-deps-mapping.cjs
+    // 运行时依赖映射（由 scripts/gen-deps-mapping.cjs 自动生成）
+    // 重新生成: node scripts/gen-deps-mapping.cjs
     ...require('./electron-builder.config.deps.cjs'),
   ],
 

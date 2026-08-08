@@ -24,7 +24,7 @@ export const TabBar: React.FC = () => {
   const [contextMenu, setContextMenu] = useState<ContextMenuState | null>(null);
   const tabsContainerRef = useRef<HTMLDivElement>(null);
 
-  // 榧犳爣婊氳疆姘村钩婊氬姩
+  // 鼠标滚轮水平滚动
   useEffect(() => {
     const container = tabsContainerRef.current;
     if (!container) return;
@@ -175,7 +175,7 @@ export const TabBar: React.FC = () => {
         </div>
       </div>
 
-      {/* 鍙抽敭鑿滃崟 */}
+      {/* 右键菜单 */}
       {contextMenu && (
         <ContextMenu
           x={contextMenu.x}

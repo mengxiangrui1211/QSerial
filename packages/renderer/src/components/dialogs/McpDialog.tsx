@@ -2,7 +2,7 @@
  * MCP AI 服务器对话框 — 47 个工具 + Resources + Prompts + Notifications + Sampling + 控制面板
  */
 
-import React, { useEffect, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { useMcpStore } from '@/stores/mcp';
 
@@ -425,38 +425,50 @@ export const McpDialog: React.FC<McpDialogProps> = ({ isOpen, onClose }) => {
     return;
   }, [isOpen, loadStatus]);
 
-  const toggleParams = (name: string) => {
+  const toggleParams = useCallback((name: string) => {
     setExpandedParams((prev) => {
       const next = new Set(prev);
       next.has(name) ? next.delete(name) : next.add(name);
       return next;
     });
-  };
+  }, []);
 
-  const handlePortChange = (value: string) => {
-    const port = parseInt(value, 10);
-    if (!isNaN(port) && port > 0 && port <= 65535) {
-      setLocalPort(port);
-      updateConfig({ port });
-    }
-  };
+  const handlePortChange = useCallback(
+    (value: string) => {
+      const port = parseInt(value, 10);
+      if (!isNaN(port) && port > 0 && port <= 65535) {
+        setLocalPort(port);
+        updateConfig({ port });
+      }
+    },
+    [updateConfig]
+  );
 
-  const handleListenAddressChange = (value: string) => {
-    setLocalListenAddress(value);
-    updateConfig({ listenAddress: value });
-  };
+  const handleListenAddressChange = useCallback(
+    (value: string) => {
+      setLocalListenAddress(value);
+      updateConfig({ listenAddress: value });
+    },
+    [updateConfig]
+  );
 
-  const handleAuthPasswordChange = (value: string) => {
-    setLocalAuthPassword(value);
-    updateConfig({ authPassword: value });
-  };
+  const handleAuthPasswordChange = useCallback(
+    (value: string) => {
+      setLocalAuthPassword(value);
+      updateConfig({ authPassword: value });
+    },
+    [updateConfig]
+  );
 
-  const handleCorsOriginsChange = (value: string) => {
-    setLocalCorsOrigins(value);
-    updateConfig({ corsOrigins: value });
-  };
+  const handleCorsOriginsChange = useCallback(
+    (value: string) => {
+      setLocalCorsOrigins(value);
+      updateConfig({ corsOrigins: value });
+    },
+    [updateConfig]
+  );
 
-  const handleStart = async () => {
+  const handleStart = useCallback(async () => {
     updateConfig({
       port: localPort,
       listenAddress: localListenAddress,
@@ -464,18 +476,28 @@ export const McpDialog: React.FC<McpDialogProps> = ({ isOpen, onClose }) => {
       corsOrigins: localCorsOrigins,
     });
     await startServer();
-  };
+  }, [
+    updateConfig,
+    startServer,
+    localPort,
+    localListenAddress,
+    localAuthPassword,
+    localCorsOrigins,
+  ]);
 
-  const handleStop = async () => {
+  const handleStop = useCallback(async () => {
     await stopServer();
-  };
+  }, [stopServer]);
+
+  const filteredTools = useMemo(
+    () => ALL_TOOLS.filter((t) => t.cat === selectedCat),
+    [selectedCat]
+  );
 
   if (!isOpen) return null;
 
-  const filteredTools = ALL_TOOLS.filter((t) => t.cat === selectedCat);
-
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-background/60 backdrop-blur-sm">
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-background/80">
       <div className="bg-surface border border-border rounded-xl shadow-2xl w-[720px] max-h-[85vh] flex flex-col">
         {/* Header */}
         <div className="px-5 py-4 border-b border-border flex items-center justify-between flex-shrink-0">
@@ -508,8 +530,11 @@ export const McpDialog: React.FC<McpDialogProps> = ({ isOpen, onClose }) => {
           </button>
         </div>
 
-        {/* Body - scrollable */}
-        <div className="flex-1 overflow-y-auto px-5 py-4 space-y-4">
+        {/* Body - scrollable (GPU 加速避免滚动卡顿) */}
+        <div
+          className="flex-1 overflow-y-auto px-5 py-4 space-y-4"
+          style={{ willChange: 'transform', transform: 'translateZ(0)' }}
+        >
           {/* 控制面板 */}
           <div className="bg-background/40 rounded-lg border border-border/50 p-4 space-y-3">
             {/* 端口 */}

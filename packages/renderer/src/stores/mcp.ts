@@ -116,21 +116,42 @@ export const useMcpStore = create<McpState & McpActions>()(
       loadStatus: async () => {
         try {
           const status: McpServerStatus = await window.qserial.mcp.getStatus();
-          const { starting, stopping, running: currentRunning } = get();
-          if (starting || stopping) return;
+          const state = get();
+          if (state.starting || state.stopping) return;
           if (status.running) {
-            set((state) => ({
+            // 仅在数据实际变化时才更新，避免无意义的重渲染导致滚动卡顿
+            const portChanged = status.port !== undefined && status.port !== state.config.port;
+            const addrChanged =
+              status.listenAddress !== undefined &&
+              status.listenAddress !== state.config.listenAddress;
+            const tokenChanged = (status.token || undefined) !== state.activeToken;
+            const connChanged =
+              status.connections.length !== state.connections.length ||
+              status.connections.some(
+                (c, i) =>
+                  c.id !== state.connections[i]?.id || c.state !== state.connections[i]?.state
+              );
+
+            if (!portChanged && !addrChanged && !tokenChanged && !connChanged && state.running) {
+              return; // 无变化，跳过更新
+            }
+
+            set({
               running: true,
-              config: {
-                ...state.config,
-                port: status.port ?? state.config.port,
-                listenAddress: status.listenAddress ?? state.config.listenAddress,
-              },
-              connections: status.connections,
-              activeToken: status.token || undefined,
-            }));
+              config:
+                portChanged || addrChanged
+                  ? {
+                      ...state.config,
+                      port: status.port ?? state.config.port,
+                      listenAddress: status.listenAddress ?? state.config.listenAddress,
+                    }
+                  : state.config,
+              connections: connChanged ? status.connections : state.connections,
+              activeToken: tokenChanged ? status.token || undefined : state.activeToken,
+            });
           } else {
-            if (currentRunning) {
+            if (!state.running && state.connections.length === 0) return; // 已经是停止状态，跳过
+            if (state.running) {
               console.log(
                 '[MCP] loadStatus: main process reports not running, syncing state to false'
               );
