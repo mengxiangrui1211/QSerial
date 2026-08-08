@@ -31,6 +31,7 @@ QSerial/
 | `pnpm run lint:fix` | ESLint with auto-fix |
 | `pnpm run format` | Prettier formatting |
 | `pnpm run package:win` | Package Windows installer + portable exe |
+| `./build-win.sh [--deploy]` | One-click Windows build on Linux/WSL2; `--deploy` uploads artifacts to the server configured in `.env` |
 
 Tests live in `packages/*/__tests__/` matching the source structure. Use `describe`/`it` from vitest.
 

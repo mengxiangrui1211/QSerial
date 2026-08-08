@@ -85,9 +85,6 @@ module.exports = {
     artifactName: '${productName}-${version}-${arch}-${os}.${ext}',
   },
 
-    win: {
-    icon: 'build/icon.ico',
-  },
   nsis: {
     artifactName: '${productName}-${version}-${arch}-${os}.${ext}',
     oneClick: false,

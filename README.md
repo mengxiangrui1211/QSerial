@@ -41,6 +41,19 @@ pnpm start        # run pre-built app
 pnpm run package:win  # build Windows installer + portable exe
 ```
 
+## One-Click Build & Deploy (Linux / WSL2)
+
+```bash
+./build-win.sh              # build NSIS installer + portable exe + win-unpacked
+./build-win.sh --deploy     # build, then upload artifacts to your Aliyun server
+./build-win.sh --help       # show usage
+```
+
+Deployment uses `scp`/`ssh` to upload `release/*.exe` to the server. Configure
+server info in `.env` (copy from `.env.example` and fill in `QSERIAL_HOST`,
+`QSERIAL_USER`, `QSERIAL_WEB_ROOT`). Requires Node >= 20, pnpm, python3, and
+SSH access to the target server.
+
 ## MCP Client Config
 
 Add to your AI client's MCP configuration. Two transports are supported:

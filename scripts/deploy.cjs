@@ -47,24 +47,38 @@ function targetWebsite() {
 
 function targetRelease() {
   const releaseDir = path.join(ROOT, 'release');
+  const { version } = require(path.join(ROOT, 'package.json'));
 
   // 确保服务端子目录存在
   const mkdir = `ssh ${SERVER_USER}@${SERVER_HOST} "mkdir -p ${WEB_ROOT}/download/installer ${WEB_ROOT}/download/portable"`;
   console.log('  → 创建子目录...');
   execSync(mkdir, { stdio: 'inherit' });
 
-  const installerExe = path.join(releaseDir, 'QSerial-1.1.0-x64-win.exe');
-  const portableExe = path.join(releaseDir, 'QSerial-1.1.0-x64-win-portable.exe');
+  const installerExe = path.join(releaseDir, `QSerial-${version}-x64-win.exe`);
+  const portableExe = path.join(releaseDir, `QSerial-${version}-x64-win-portable.exe`);
 
-  if (!fs.existsSync(installerExe) || !fs.existsSync(portableExe)) {
-    console.log('⚠️  release/ 目录缺少安装包，请先 pnpm run package:win:ci\n');
-    return;
+  let uploaded = 0;
+  if (fs.existsSync(installerExe)) {
+    console.log('\n📦 部署 NSIS 安装包...');
+    scp(installerExe, `${WEB_ROOT}/download/installer/${path.basename(installerExe)}`);
+    uploaded++;
+  } else {
+    console.log(`⚠️  缺少 NSIS 安装包，跳过: ${path.basename(installerExe)}`);
   }
 
-  console.log('\n📦 部署安装包...');
-  scp(installerExe, `${WEB_ROOT}/download/installer/QSerial-1.1.0-x64-win.exe`);
-  scp(portableExe, `${WEB_ROOT}/download/portable/QSerial-1.1.0-x64-win-portable.exe`);
-  console.log('✅ 安装包部署完成\n');
+  if (fs.existsSync(portableExe)) {
+    console.log('\n📦 部署 portable 免安装版...');
+    scp(portableExe, `${WEB_ROOT}/download/portable/${path.basename(portableExe)}`);
+    uploaded++;
+  } else {
+    console.log(`⚠️  缺少 portable 免安装版，跳过: ${path.basename(portableExe)}`);
+  }
+
+  if (uploaded === 0) {
+    console.log('⚠️  release/ 目录没有可部署的安装包，请先运行 pnpm run package:win 或 ./build-win.sh\n');
+  } else {
+    console.log(`✅ 安装包部署完成 (${uploaded} 个文件)\n`);
+  }
 }
 
 function targetNginx() {
