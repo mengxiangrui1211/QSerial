@@ -16,7 +16,7 @@ export function sendMCPNotification(method: string, params: Record<string, unkno
   const msg = JSON.stringify({ jsonrpc: '2.0', method, params });
   for (const client of sseClients) {
     try {
-      client.write('data: ' + msg + '\n\n');
+      client.write('event: message\ndata: ' + msg + '\n\n');
     } catch {
       sseClients.delete(client);
     }

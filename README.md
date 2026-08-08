@@ -43,11 +43,32 @@ pnpm run package:win  # build Windows installer + portable exe
 
 ## MCP Client Config
 
-Add to your AI client's MCP configuration:
+Add to your AI client's MCP configuration. Two transports are supported:
+
+**Streamable HTTP**(推荐):JSON-RPC 请求与响应都在 POST 请求中完成
 
 ```json
 {"mcpServers":{"qserial":{"type":"streamable-http","url":"http://127.0.0.1:9800/mcp"}}}
 ```
+
+**SSE**:客户端先 `GET /sse` 建立事件流,JSON-RPC 响应经该流以 `message` 事件推送
+
+```json
+{"mcpServers":{"qserial":{"type":"sse","url":"http://127.0.0.1:9800/sse"}}}
+```
+
+### 鉴权(Token)
+
+MCP 服务器默认关闭鉴权。一旦设置了访问令牌(或在非 localhost 监听时自动生成随机令牌),客户端必须在请求中携带 token:
+
+- Streamable HTTP:请求头 `Authorization: Bearer <token>`
+- SSE:URL 查询参数 `http://127.0.0.1:9800/sse?token=<token>`,或同样使用 `Authorization` 请求头
+
+令牌可在 MCP 对话框的状态面板中查看。
+
+### 监听地址
+
+默认只监听 `127.0.0.1`(仅本机可访问)。需要局域网内其他机器接入时,在 MCP 对话框中把监听地址改为 `0.0.0.0`;此时若未手动设置 token,服务会自动生成一个随机 token,请从对话框状态面板或启动日志中获取。
 
 ## Capabilities
 

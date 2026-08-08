@@ -5,7 +5,6 @@
 
 import * as http from 'node:http';
 import * as crypto from 'node:crypto';
-import { SSEServerTransport } from '@modelcontextprotocol/sdk/server/sse.js';
 import { BrowserWindow } from 'electron';
 import { ConnectionFactory } from '../connection/factory.js';
 import { IPC_CHANNELS } from '@qserial/shared';
@@ -38,6 +37,7 @@ let mcpServer: http.Server | null = null;
 let mcpRunning = false;
 let mcpPort = 9800;
 let mcpListenAddress = '127.0.0.1';
+let removeConnectionDestroyHook: (() => void) | null = null;
 
 // 构建 ToolContext
 const toolContext: ToolContext = {
@@ -824,47 +824,102 @@ function checkAuth(req: http.IncomingMessage, res: http.ServerResponse): boolean
   return true;
 }
 
+// ==================== RPC 响应通道 ====================
+// HTTP (streamable) 把响应写在 POST 响应体里;
+// SSE 把响应以 message 事件推送到长连接流,POST 只返回 202 确认(符合 MCP SSE 传输规范)。
+
+interface RpcChannel {
+  /** 发送 JSON-RPC 响应/错误消息 */
+  send(payload: Record<string, unknown>): void;
+  /** 确认通知:HTTP 返回 202 空响应体 */
+  ack(): void;
+  /** 请求体解析失败:HTTP 返回 400,SSE 推送 parse error 到流 */
+  parseError(): void;
+}
+
+function createHttpChannel(res: http.ServerResponse): RpcChannel {
+  return {
+    send(payload) {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify(payload));
+    },
+    ack() {
+      res.writeHead(202);
+      res.end();
+    },
+    parseError() {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ jsonrpc: '2.0', error: { code: -32700, message: 'Parse error' } }));
+    },
+  };
+}
+
+interface SseSession {
+  id: string;
+  res: http.ServerResponse;
+}
+
+/** sessionId -> SSE 长连接,用于把 JSON-RPC 响应路由回对应客户端 */
+const sseSessions = new Map<string, SseSession>();
+
+function writeSseEvent(res: http.ServerResponse, payload: Record<string, unknown>): void {
+  if (res.writableEnded || res.destroyed) return;
+  res.write('event: message\ndata: ' + JSON.stringify(payload) + '\n\n');
+}
+
+function createSseChannel(session: SseSession, postRes: http.ServerResponse): RpcChannel {
+  return {
+    send(payload) {
+      writeSseEvent(session.res, payload);
+      postRes.writeHead(202);
+      postRes.end();
+    },
+    ack() {
+      postRes.writeHead(202);
+      postRes.end();
+    },
+    parseError() {
+      writeSseEvent(session.res, {
+        jsonrpc: '2.0',
+        error: { code: -32700, message: 'Parse error' },
+      });
+      postRes.writeHead(202);
+      postRes.end();
+    },
+  };
+}
+
 // ==================== JSON-RPC handler builder ====================
 
-function createRpcHandler(): (
-  _req: http.IncomingMessage,
-  res: http.ServerResponse,
-  body: string
-) => Promise<void> {
-  return async (_req, res, body) => {
+function createRpcHandler(): (channel: RpcChannel, body: string) => Promise<void> {
+  return async (channel, body) => {
     try {
       const rpcData = JSON.parse(body);
       const { id: reqId, method, params } = rpcData;
 
       if (method === 'initialize') {
-        res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(
-          JSON.stringify({
-            jsonrpc: '2.0',
-            id: reqId,
-            result: {
-              protocolVersion: '2025-03-26',
-              capabilities: { tools: {}, resources: {}, sampling: {}, prompts: {} },
-              serverInfo: { name: 'qserial-mcp', version: '0.1.0' },
-            },
-          })
-        );
+        channel.send({
+          jsonrpc: '2.0',
+          id: reqId,
+          result: {
+            protocolVersion: '2025-03-26',
+            capabilities: { tools: {}, resources: {}, sampling: {}, prompts: {} },
+            serverInfo: { name: 'qserial-mcp', version: '0.1.0' },
+          },
+        });
         return;
       }
       if (method === 'notifications/initialized') {
-        res.writeHead(202);
-        res.end();
+        channel.ack();
         return;
       }
       if (method === 'tools/list') {
-        res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ jsonrpc: '2.0', id: reqId, result: { tools: MCP_TOOLS } }));
+        channel.send({ jsonrpc: '2.0', id: reqId, result: { tools: MCP_TOOLS } });
         return;
       }
       if (method === 'tools/call') {
         try {
           const text = await executeTool(params.name, params.arguments || {});
-          res.writeHead(200, { 'Content-Type': 'application/json' });
           const sDrain = drainSampling();
           const resp: Record<string, unknown> = {
             jsonrpc: '2.0',
@@ -872,43 +927,34 @@ function createRpcHandler(): (
             result: { content: [{ type: 'text', text }], isError: false },
           };
           if (sDrain) resp.sampling = sDrain;
-          res.end(JSON.stringify(resp));
+          channel.send(resp);
         } catch (e) {
           const error = e as Error;
-          res.writeHead(200, { 'Content-Type': 'application/json' });
-          res.end(
-            JSON.stringify({
-              jsonrpc: '2.0',
-              id: reqId,
-              error: { code: -32603, message: error.message },
-            })
-          );
+          channel.send({
+            jsonrpc: '2.0',
+            id: reqId,
+            error: { code: -32603, message: error.message },
+          });
         }
         return;
       }
       if (method === 'resources/list') {
-        res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(
-          JSON.stringify({
-            jsonrpc: '2.0',
-            id: reqId,
-            result: { resources: [...MCP_RESOURCES, ...getPluginResources()] },
-          })
-        );
+        channel.send({
+          jsonrpc: '2.0',
+          id: reqId,
+          result: { resources: [...MCP_RESOURCES, ...getPluginResources()] },
+        });
         return;
       }
       if (method === 'resources/read') {
         try {
           const rUri = (params as { uri: string }).uri;
           if (!rUri) {
-            res.writeHead(200, { 'Content-Type': 'application/json' });
-            res.end(
-              JSON.stringify({
-                jsonrpc: '2.0',
-                id: reqId,
-                error: { code: -32602, message: 'Missing uri' },
-              })
-            );
+            channel.send({
+              jsonrpc: '2.0',
+              id: reqId,
+              error: { code: -32602, message: 'Missing uri' },
+            });
             return;
           }
           let result = await readResource(rUri);
@@ -921,47 +967,36 @@ function createRpcHandler(): (
             }
           }
           if (!result) {
-            res.writeHead(200, { 'Content-Type': 'application/json' });
-            res.end(
-              JSON.stringify({
-                jsonrpc: '2.0',
-                id: reqId,
-                error: { code: -32002, message: 'Resource not found: ' + rUri },
-              })
-            );
-            return;
-          }
-          res.writeHead(200, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ jsonrpc: '2.0', id: reqId, result }));
-        } catch (e) {
-          const err = e as Error;
-          res.writeHead(200, { 'Content-Type': 'application/json' });
-          res.end(
-            JSON.stringify({
+            channel.send({
               jsonrpc: '2.0',
               id: reqId,
-              error: { code: -32603, message: err.message },
-            })
-          );
+              error: { code: -32002, message: 'Resource not found: ' + rUri },
+            });
+            return;
+          }
+          channel.send({ jsonrpc: '2.0', id: reqId, result });
+        } catch (e) {
+          const err = e as Error;
+          channel.send({
+            jsonrpc: '2.0',
+            id: reqId,
+            error: { code: -32603, message: err.message },
+          });
         }
         return;
       }
       if (method === 'sampling/response') {
         const sr = params as Record<string, string>;
         if (sr.samplingId && sr.choice) resolveSampling(sr.samplingId, sr.choice);
-        res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ jsonrpc: '2.0', id: reqId, result: { acknowledged: true } }));
+        channel.send({ jsonrpc: '2.0', id: reqId, result: { acknowledged: true } });
         return;
       }
       if (method === 'prompts/list') {
-        res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(
-          JSON.stringify({
-            jsonrpc: '2.0',
-            id: reqId,
-            result: { prompts: [...MCP_PROMPTS, ...getPluginPrompts()] },
-          })
-        );
+        channel.send({
+          jsonrpc: '2.0',
+          id: reqId,
+          result: { prompts: [...MCP_PROMPTS, ...getPluginPrompts()] },
+        });
         return;
       }
       if (method === 'prompts/get') {
@@ -979,36 +1014,27 @@ function createRpcHandler(): (
           }
         }
         if (!result) {
-          res.writeHead(200, { 'Content-Type': 'application/json' });
-          res.end(
-            JSON.stringify({
-              jsonrpc: '2.0',
-              id: reqId,
-              error: { code: -32002, message: 'Prompt not found: ' + name },
-            })
-          );
+          channel.send({
+            jsonrpc: '2.0',
+            id: reqId,
+            error: { code: -32002, message: 'Prompt not found: ' + name },
+          });
           return;
         }
-        res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ jsonrpc: '2.0', id: reqId, result }));
+        channel.send({ jsonrpc: '2.0', id: reqId, result });
         return;
       }
       if (method === 'ping') {
-        res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ jsonrpc: '2.0', id: reqId, result: {} }));
+        channel.send({ jsonrpc: '2.0', id: reqId, result: {} });
         return;
       }
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(
-        JSON.stringify({
-          jsonrpc: '2.0',
-          id: reqId,
-          error: { code: -32601, message: 'unknown method: ' + method },
-        })
-      );
+      channel.send({
+        jsonrpc: '2.0',
+        id: reqId,
+        error: { code: -32601, message: 'unknown method: ' + method },
+      });
     } catch {
-      res.writeHead(400, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ jsonrpc: '2.0', error: { code: -32700, message: 'Parse error' } }));
+      channel.parseError();
     }
   };
 }
@@ -1040,7 +1066,8 @@ export async function startMcpServer(
     console.log('[MCP] Use: Authorization: Bearer ' + pwd);
   }
 
-  ConnectionFactory.onDestroy((conn) => ctx.removeBuffer(conn.id));
+  if (removeConnectionDestroyHook) removeConnectionDestroyHook();
+  removeConnectionDestroyHook = ConnectionFactory.onDestroy((conn) => ctx.removeBuffer(conn.id));
   loadPlugins();
 
   const handleRpc = createRpcHandler();
@@ -1064,26 +1091,49 @@ export async function startMcpServer(
 
     const urlPath = (req.url || '/').split('?')[0];
 
-    // SSE endpoint
+    // SSE 握手端点:返回 endpoint 事件并保持长连接,
+    // 后续 /messages 的 JSON-RPC 响应都经这条流以 message 事件推送
     if (req.method === 'GET' && urlPath === '/sse') {
       if (!checkAuth(req, res)) return;
+      const sessionId = crypto.randomUUID();
+      res.writeHead(200, {
+        'Content-Type': 'text/event-stream',
+        'Cache-Control': 'no-cache, no-transform',
+        Connection: 'keep-alive',
+        'X-Accel-Buffering': 'no',
+      });
+      res.write(`event: endpoint\ndata: /messages?sessionId=${sessionId}\n\n`);
+      const session: SseSession = { id: sessionId, res };
+      sseSessions.set(sessionId, session);
       sseClients.add(res);
-      const sseTransport = new SSEServerTransport('/messages', res);
       req.on('close', () => {
+        sseSessions.delete(sessionId);
         sseClients.delete(res);
-        sseTransport.close().catch(() => {});
       });
       return;
     }
 
-    // SSE message endpoint
+    // SSE 消息端点:POST 携带 JSON-RPC 请求,响应经 SSE 流返回,POST 本身只确认 202
     if (req.method === 'POST' && urlPath === '/messages') {
       if (ctx.mcpAuthPassword && !checkAuth(req, res)) return;
+      const sessionId =
+        new URLSearchParams((req.url || '').split('?')[1] || '').get('sessionId') || '';
+      const session = sseSessions.get(sessionId);
+      if (!session) {
+        res.writeHead(404, { 'Content-Type': 'application/json' });
+        res.end(
+          JSON.stringify({
+            jsonrpc: '2.0',
+            error: { code: -32004, message: 'SSE session not found' },
+          })
+        );
+        return;
+      }
       let body = '';
       req.on('data', (chunk: Buffer) => {
         body += chunk.toString();
       });
-      req.on('end', () => handleRpc(req, res, body));
+      req.on('end', () => handleRpc(createSseChannel(session, res), body));
       return;
     }
 
@@ -1094,7 +1144,7 @@ export async function startMcpServer(
       req.on('data', (chunk: Buffer) => {
         body += chunk.toString();
       });
-      req.on('end', () => handleRpc(req, res, body));
+      req.on('end', () => handleRpc(createHttpChannel(res), body));
       return;
     }
 
@@ -1109,7 +1159,8 @@ export async function startMcpServer(
   await new Promise<void>((resolve, reject) => {
     httpServer.listen(port, mcpListenAddress, () => {
       mcpRunning = true;
-      mcpPort = port;
+      // port 为 0 时由系统分配实际端口,需要回读真实端口
+      mcpPort = (httpServer.address() as { port: number } | null)?.port ?? port;
       mcpServer = httpServer;
       sendStatus();
       resolve();
@@ -1128,6 +1179,22 @@ export async function startMcpServer(
 }
 
 export async function stopMcpServer(): Promise<void> {
+  if (removeConnectionDestroyHook) {
+    removeConnectionDestroyHook();
+    removeConnectionDestroyHook = null;
+  }
+
+  // 先关闭所有 SSE 长连接,否则 server.close() 会一直等待活跃连接
+  for (const session of sseSessions.values()) {
+    try {
+      session.res.end();
+    } catch {
+      /* ignore */
+    }
+  }
+  sseSessions.clear();
+  sseClients.clear();
+
   const server = mcpServer;
   if (server) {
     await new Promise<void>((resolve) => {
