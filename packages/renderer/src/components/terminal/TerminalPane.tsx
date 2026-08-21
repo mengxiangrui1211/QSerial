@@ -17,6 +17,7 @@ import 'xterm/css/xterm.css';
 
 import { ConnectionShareDialog } from '../dialogs/ConnectionShareDialog';
 import { globalError } from '../common/ErrorToast';
+import { AtTransactionPanel, type AtTransaction } from './AtTransactionPanel';
 
 // xterm.js 5.x 内部 API 类型（非公共 API，用于兼容性 patch）
 interface XTermCore {
@@ -68,8 +69,103 @@ export const TerminalPane: React.FC<TerminalPaneProps> = React.memo(
     const searchDebounceRef = useRef<ReturnType<typeof setTimeout>>();
     const searchPosRef = useRef(-1);
     const [showSerialShareDialog, setShowSerialShareDialog] = useState(false);
+    // P0: 暂停滚动状态（用于触发重渲染）
+    const [pauseScrollState, setPauseScrollState] = useState(false);
+    // P0: 常驻命令输入框
+    const [cmdInputValue, setCmdInputValue] = useState('');
+    const [cmdMode, setCmdMode] = useState<'text' | 'hex'>('text');
+    const cmdInputRef = useRef<HTMLInputElement>(null);
+
+    // P1: AT 事务追踪
+    const [atTransactions, setAtTransactions] = useState<AtTransaction[]>([]);
+    const pendingAtRef = useRef<{ command: string; timestamp: number } | null>(null);
+    const atResponseBufferRef = useRef<string>('');
     const timeoutIdsRef = useRef<ReturnType<typeof setTimeout>[]>([]);
     const mountCountRef = useRef(0);
+
+    // P0: 时间戳 + 收发分色 + 暂停滚动
+    const atNewLineRef = useRef(true);        // 是否在新行开头（用于注入时间戳）
+    const pauseScrollRef = useRef(false);      // 是否暂停自动滚动
+    const timestampEnabledRef = useRef(true);  // 时间戳开关
+
+    // 格式化时间戳 [HH:MM:SS.mmm]
+    const formatTimestamp = useCallback((): string => {
+      const now = new Date();
+      const h = String(now.getHours()).padStart(2, '0');
+      const m = String(now.getMinutes()).padStart(2, '0');
+      const s = String(now.getSeconds()).padStart(2, '0');
+      const ms = String(now.getMilliseconds()).padStart(3, '0');
+      return `${h}:${m}:${s}.${ms}`;
+    }, []);
+
+    // 带时间戳 + 方向色的写入
+    // direction: 'rx' (接收,默认色) | 'tx' (发送,蓝色) | 'noise' (噪声,暗色)
+    const writeWithTimestamp = useCallback(
+      (terminal: XTerm, data: Uint8Array | string, direction: 'rx' | 'tx' | 'noise' = 'rx') => {
+        if (!timestampEnabledRef.current) {
+          // 不启用时间戳时直接写入，仅做方向着色
+          if (direction === 'tx') {
+            terminal.write(`\x1b[38;5;69m${typeof data === 'string' ? data : new TextDecoder().decode(data)}\x1b[0m`);
+          } else if (direction === 'noise') {
+            terminal.write(`\x1b[38;5;240m${typeof data === 'string' ? data : new TextDecoder().decode(data)}\x1b[0m`);
+          } else {
+            terminal.write(data);
+          }
+          return;
+        }
+
+        const text = typeof data === 'string' ? data : new TextDecoder().decode(data);
+        // 按换行符拆分，每段在新行开头注入时间戳
+        const parts = text.split(/(\r\n|\n|\r)/);
+        const ts = formatTimestamp();
+
+        // ANSI 颜色码
+        const colorTx = '\x1b[38;5;69m';   // 柔蓝
+        const colorNoise = '\x1b[38;5;240m'; // 暗灰
+        const colorTs = '\x1b[38;5;240m';    // 时间戳暗灰
+        const colorReset = '\x1b[0m';
+        const colorDir = direction === 'tx' ? colorTx : direction === 'noise' ? colorNoise : '';
+
+        for (let i = 0; i < parts.length; i++) {
+          const part = parts[i];
+          if (part === '') continue;
+
+          // 如果是换行符
+          if (/^\r\n$|^\n$|^\r$/.test(part)) {
+            terminal.write(part);
+            atNewLineRef.current = true;
+            continue;
+          }
+
+          // 在新行开头注入时间戳
+          if (atNewLineRef.current) {
+            const dirLabel = direction === 'tx' ? 'TX' : 'RX';
+            terminal.write(`${colorTs}[${ts}] ${dirLabel}${colorReset} `);
+            atNewLineRef.current = false;
+          }
+
+          // 写入数据（带方向色 + 关键字高亮）
+          if (colorDir) {
+            // 噪声数据直接暗色写入
+            terminal.write(`${colorDir}${part}${colorReset}`);
+          } else {
+            // RX 正常数据：检测并高亮关键字 OK/ERROR/WARN/+XXX
+            const highlighted = part
+              .replace(/\b(OK)\b/g, '\x1b[38;5;72m$1\x1b[0m')
+              .replace(/\b(ERROR|FAIL|FAILED)\b/g, '\x1b[38;5;203m$1\x1b[0m')
+              .replace(/\b(WARN|WARNING)\b/g, '\x1b[38;5;179m$1\x1b[0m')
+              .replace(/(\+[A-Z]+:)/g, '\x1b[38;5;141m$1\x1b[0m');
+            terminal.write(highlighted);
+          }
+        }
+
+        // 如果数据以换行结尾，标记下次在新行注入时间戳
+        if (/\r\n$|\n$|\r$/.test(text)) {
+          atNewLineRef.current = true;
+        }
+      },
+      [formatTimestamp]
+    );
 
     // 使用 selector 精准订阅，避免其他 session 变更导致本组件重渲染
     const session = useTerminalStore((state) => state.sessions[sessionId]);
@@ -412,6 +508,10 @@ export const TerminalPane: React.FC<TerminalPaneProps> = React.memo(
           console.log('[TerminalPane] onData blocked by composition');
           return;
         }
+
+        // P0: 发送数据(TX)写入终端显示，用蓝色 + 时间戳标记
+        writeWithTimestamp(xterm, data, 'tx');
+
         // 如果数据与 composition 结束时的数据相同，发送后清空标记
         if (data === compositionDataRef.current) {
           console.log('[TerminalPane] onData sending (composition end)');
@@ -435,13 +535,52 @@ export const TerminalPane: React.FC<TerminalPaneProps> = React.memo(
           if (disposedRef.current) return;
           try {
             const data = base64ToUint8Array(base64Data);
-            // 直接写入 Uint8Array，避免 TextDecoder 对非 UTF-8 数据解码产生无效字符
-            xterm.write(data);
+            // P0: 检测噪声数据（如 ?MVA(...)! 刷屏模式）
+            let direction: 'rx' | 'noise' = 'rx';
+            const text = new TextDecoder().decode(data);
+            // 噪声特征：以 ? 或不可见控制字符开头，且行内无 AT 响应关键字
+            if (/^[?\x00-\x1f].{3,}/.test(text) && !/^(OK|ERROR|\+|REBOOT|#|\$)/.test(text.trim())) {
+              direction = 'noise';
+            }
+
+            // P0: 带时间戳 + 方向色写入
+            writeWithTimestamp(xterm, data, direction);
+
+            // P1: AT 事务响应追踪
+            if (pendingAtRef.current && direction !== 'noise') {
+              atResponseBufferRef.current += text;
+              const buf = atResponseBufferRef.current;
+              // 检测 OK / ERROR 完成响应
+              if (/\bOK\b/.test(buf) || /\bERROR\b/.test(buf) || /\bFAIL/.test(buf)) {
+                const isOk = /\bOK\b/.test(buf);
+                const elapsed = Date.now() - pendingAtRef.current.timestamp;
+                const responseText = buf.trim();
+                setAtTransactions((prev) =>
+                  [
+                    {
+                      id: `at-${pendingAtRef.current!.timestamp}`,
+                      command: pendingAtRef.current!.command,
+                      response: responseText,
+                      status: isOk ? ('ok' as const) : ('error' as const),
+                      timestamp: pendingAtRef.current!.timestamp,
+                      durationMs: elapsed,
+                    },
+                    ...prev,
+                  ].slice(0, 50)
+                );
+                pendingAtRef.current = null;
+                atResponseBufferRef.current = '';
+              }
+            }
+
+            // P0: 暂停滚动时不自动滚到底部
+            if (!pauseScrollRef.current) {
+              xterm.scrollToBottom();
+            }
 
             // 实时写入日志（日志需要文本）
             const currentSession = useTerminalStore.getState().sessions[sessionId];
             if (currentSession?.logEnabled && currentSession?.logFilePath) {
-              const text = new TextDecoder().decode(data);
               window.qserial.log.write(sessionId, text).catch((err) => {
                 console.error('Failed to write log:', err);
               });
@@ -823,8 +962,7 @@ export const TerminalPane: React.FC<TerminalPaneProps> = React.memo(
 
     return (
       <div
-        ref={containerRef}
-        className="terminal-container"
+        className="flex"
         style={{
           position: 'absolute',
           top: 0,
@@ -833,6 +971,10 @@ export const TerminalPane: React.FC<TerminalPaneProps> = React.memo(
           bottom: 0,
           visibility: isActive ? 'visible' : 'hidden',
         }}
+      >
+      <div
+        ref={containerRef}
+        className="terminal-container flex-1 relative"
         onContextMenu={(e) => {
           e.preventDefault();
         }}
@@ -840,6 +982,32 @@ export const TerminalPane: React.FC<TerminalPaneProps> = React.memo(
         {/* 控制按钮组 */}
         {isActive && (
           <div className="absolute top-2 right-2 z-10 flex gap-2">
+            {/* P0: 暂停滚动按钮 */}
+            <button
+              onClick={() => {
+                pauseScrollRef.current = !pauseScrollRef.current;
+                setPauseScrollState(pauseScrollRef.current);
+              }}
+              className={`px-2 py-1 border rounded text-xs transition-colors flex items-center gap-1.5 ${
+                pauseScrollState
+                  ? 'bg-warning/20 border-warning/50 text-warning'
+                  : 'bg-surface/80 border-border hover:bg-hover'
+              }`}
+              title={pauseScrollState ? t('terminalPane.resumeScroll', '恢复滚动') : t('terminalPane.pauseScroll', '暂停滚动')}
+            >
+              {pauseScrollState ? (
+                <svg width="12" height="12" viewBox="0 0 12 12" fill="currentColor">
+                  <path d="M3 2L9 6L3 10Z" />
+                </svg>
+              ) : (
+                <svg width="12" height="12" viewBox="0 0 12 12" fill="none">
+                  <rect x="3" y="2" width="2" height="8" rx="0.5" fill="currentColor" />
+                  <rect x="7" y="2" width="2" height="8" rx="0.5" fill="currentColor" />
+                </svg>
+              )}
+              {pauseScrollState ? (t('terminalPane.paused', '已暂停')) : (t('terminalPane.pause', '暂停'))}
+            </button>
+
             {/* 搜索栏 / 搜索按钮 */}
             {searchVisible ? (
               <div className="flex flex-col bg-surface/90 border border-primary/40 rounded">
@@ -1218,6 +1386,107 @@ export const TerminalPane: React.FC<TerminalPaneProps> = React.memo(
           </div>
         )}
 
+        {/* P0: 底部常驻命令输入框 */}
+        {isActive && session?.connectionState === ConnectionState.CONNECTED && (
+          <div className="absolute bottom-0 left-0 right-0 z-10 flex items-center gap-2 px-2 py-1.5 bg-surface/95 border-t border-border">
+            <span className="text-success font-mono text-xs flex-shrink-0">&gt;</span>
+            <input
+              ref={cmdInputRef}
+              type="text"
+              value={cmdInputValue}
+              onChange={(e) => setCmdInputValue(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter') {
+                  e.preventDefault();
+                  const cmd = cmdInputValue.trim();
+                  if (!cmd || !connectionId) return;
+                  // 发送到设备
+                  const dataToSend = cmdMode === 'hex'
+                    ? cmd.replace(/\s/g, '')
+                    : cmd + '\n';
+                  if (cmdMode === 'hex') {
+                    // HEX 模式：转成二进制发送
+                    try {
+                      const hexData = dataToSend.match(/.{1,2}/g)?.map(h => parseInt(h, 16)) || [];
+                      const uint8 = new Uint8Array(hexData);
+                      const b64 = btoa(String.fromCharCode(...uint8));
+                      window.qserial.connection.write(connectionId, b64);
+                    } catch {
+                      // HEX 解析失败，忽略
+                    }
+                  } else {
+                    window.qserial.connection.write(connectionId, dataToSend);
+                  }
+                  // 写入终端显示（TX 蓝色 + 时间戳）
+                  if (xtermRef.current) {
+                    writeWithTimestamp(xtermRef.current, cmd + '\r\n', 'tx');
+                  }
+
+                  // P1: 如果是 AT 命令，标记为待追踪
+                  if (/^AT/i.test(cmd)) {
+                    pendingAtRef.current = { command: cmd, timestamp: Date.now() };
+                    atResponseBufferRef.current = '';
+                    // 先加一条 pending 记录
+                    setAtTransactions((prev) =>
+                      [
+                        {
+                          id: `at-${Date.now()}`,
+                          command: cmd,
+                          response: '',
+                          status: 'pending' as const,
+                          timestamp: Date.now(),
+                          durationMs: 0,
+                        },
+                        ...prev,
+                      ].slice(0, 50)
+                    );
+                  }
+
+                  setCmdInputValue('');
+                } else if (e.key === 'ArrowUp') {
+                  // 简单的历史回溯（后续可扩展为完整历史列表）
+                  e.preventDefault();
+                }
+              }}
+              className="flex-1 px-2 py-1 bg-background text-text text-xs font-mono border border-border rounded focus:outline-none focus:border-primary transition-colors"
+              placeholder={cmdMode === 'hex' ? '输入 HEX 数据，如 0D0A...' : '输入命令，Enter 发送...'}
+            />
+            <div className="flex gap-0.5 p-0.5 bg-background border border-border rounded">
+              <button
+                onClick={() => setCmdMode('text')}
+                className={`px-2 py-0.5 text-[10px] font-medium rounded transition-colors ${
+                  cmdMode === 'text' ? 'bg-surface text-text' : 'text-text-tertiary hover:text-text-secondary'
+                }`}
+              >
+                {t('terminalPane.text', '文本')}
+              </button>
+              <button
+                onClick={() => setCmdMode('hex')}
+                className={`px-2 py-0.5 text-[10px] font-medium rounded transition-colors ${
+                  cmdMode === 'hex' ? 'bg-surface text-text' : 'text-text-tertiary hover:text-text-secondary'
+                }`}
+              >
+                HEX
+              </button>
+            </div>
+            <button
+              onClick={() => {
+                const cmd = cmdInputValue.trim();
+                if (!cmd || !connectionId) return;
+                const dataToSend = cmd + '\n';
+                window.qserial.connection.write(connectionId, dataToSend);
+                if (xtermRef.current) {
+                  writeWithTimestamp(xtermRef.current, cmd + '\r\n', 'tx');
+                }
+                setCmdInputValue('');
+              }}
+              className="px-3 py-1 text-xs font-medium bg-surface border border-border rounded text-text hover:border-primary transition-colors flex-shrink-0"
+            >
+              {t('terminalPane.send', '发送')}
+            </button>
+          </div>
+        )}
+
         {/* 宏保存对话框 */}
         {showMacroSave && (
           <div className="dialog-overlay fixed inset-0 bg-black/50 flex items-center justify-center z-50">
@@ -1314,6 +1583,15 @@ export const TerminalPane: React.FC<TerminalPaneProps> = React.memo(
           defaultSessionId={sessionId}
         />
       </div>
+
+      {/* P1: AT 事务面板 */}
+      {isActive && (
+        <AtTransactionPanel
+          transactions={atTransactions}
+          onClear={() => setAtTransactions([])}
+        />
+      )}
+    </div>
     );
   }
 );
