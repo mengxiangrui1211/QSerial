@@ -30,6 +30,45 @@ interface XTermCore {
   };
 }
 
+/**
+ * 字节级换行归一化：把裸 LF / 裸 CR 统一为 CRLF（0x0D 0x0A）。
+ * - 幂等：已是 CRLF 的数据不受影响（不会重复插入 CR）。
+ * - UTF-8 安全：0x0A / 0x0D 在 UTF-8 编码中只表示 ASCII 控制字符，
+ *   绝不会出现在多字节序列里，因此直接扫描字节即可，无需 TextDecoder，
+ *   不会把二进制 / 中文等多字节数据打乱。
+ * 用途：消除 VT100 终端遇到裸 LF 时「阶梯式错位」（列号不前移）的问题，
+ * 同时让每一帧都从列 0 起排，长行仍可随窗口缩放软折行重排。
+ */
+function normalizeLineEndings(bytes: Uint8Array): Uint8Array {
+  // 先统计需要额外插入的 CR 数量
+  let extra = 0;
+  for (let i = 0; i < bytes.length; i++) {
+    const b = bytes[i];
+    if (b === 0x0a) {
+      if (i === 0 || bytes[i - 1] !== 0x0d) extra++;
+    } else if (b === 0x0d) {
+      if (i + 1 >= bytes.length || bytes[i + 1] !== 0x0a) extra++;
+    }
+  }
+  if (extra === 0) return bytes; // 无需改动，原样返回
+
+  const out = new Uint8Array(bytes.length + extra);
+  let j = 0;
+  for (let i = 0; i < bytes.length; i++) {
+    const b = bytes[i];
+    if (b === 0x0a) {
+      if (i === 0 || bytes[i - 1] !== 0x0d) out[j++] = 0x0d;
+      out[j++] = 0x0a;
+    } else if (b === 0x0d) {
+      if (i + 1 >= bytes.length || bytes[i + 1] !== 0x0a) out[j++] = 0x0d;
+      out[j++] = 0x0a;
+    } else {
+      out[j++] = b;
+    }
+  }
+  return out;
+}
+
 interface TerminalPaneProps {
   sessionId: string;
   connectionId: string;
@@ -435,8 +474,8 @@ export const TerminalPane: React.FC<TerminalPaneProps> = React.memo(
           if (disposedRef.current) return;
           try {
             const data = base64ToUint8Array(base64Data);
-            // 直接写入 Uint8Array，避免 TextDecoder 对非 UTF-8 数据解码产生无效字符
-            xterm.write(data);
+            // 换行归一化：裸 LF/CR → CRLF，消除阶梯式错位（UTF-8 安全，不解码原始字节）
+            xterm.write(normalizeLineEndings(data));
 
             // 实时写入日志（日志需要文本）
             const currentSession = useTerminalStore.getState().sessions[sessionId];
