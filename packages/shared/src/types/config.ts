@@ -43,6 +43,24 @@ export interface TerminalSettings {
   autoReconnect: boolean;
   reconnectInterval: number;
   reconnectAttempts: number;
+  /**
+   * 显示模式：
+   * - 'terminal' 终端仿真（VT100，适合 SSH/交互式 AT/带 ANSI 颜色）
+   * - 'monitor'  串口监控视图（pre-wrap 文本，连续显示、随窗口重排，适合帧协议调试）
+   */
+  displayMode: 'terminal' | 'monitor';
+  /**
+   * 换行符归一化（仅终端模式生效）：把裸 LF/CR 归一为 CRLF，消除阶梯错位。UTF-8 安全。
+   */
+  normalizeLineEndings: boolean;
+  /** 监控视图：每行显示时间戳 */
+  monitorTimestamp: boolean;
+  /** 监控视图：过滤 ANSI 转义序列（避免彩色日志变成乱码符号） */
+  monitorAnsiFilter: boolean;
+  /** 监控视图：按接收间隔自动插入换行分帧（解决粘包） */
+  monitorTimeoutFraming: boolean;
+  /** 监控视图：分帧间隔阈值（毫秒），超过该间隔则视为新的一帧 */
+  monitorTimeoutMs: number;
 }
 
 /**
@@ -130,6 +148,12 @@ export const DEFAULT_CONFIG: AppConfig = {
     autoReconnect: true,
     reconnectInterval: 3000,
     reconnectAttempts: 5,
+    displayMode: 'terminal',
+    normalizeLineEndings: true,
+    monitorTimestamp: false,
+    monitorAnsiFilter: true,
+    monitorTimeoutFraming: false,
+    monitorTimeoutMs: 100,
   },
 
   serial: {
