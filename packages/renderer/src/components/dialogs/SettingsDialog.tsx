@@ -59,16 +59,6 @@ export const SettingsDialog: React.FC<SettingsDialogProps> = ({ isOpen, onClose 
   const [copyOnSelect, setCopyOnSelect] = useState(config.terminal.copyOnSelect);
   const [rightClickPaste, setRightClickPaste] = useState(config.terminal.rightClickPaste);
   const [enableWebLinks, setEnableWebLinks] = useState(config.terminal.enableWebLinks);
-  const [displayMode, setDisplayMode] = useState(config.terminal.displayMode);
-  const [normalizeLineEndings, setNormalizeLineEndings] = useState(
-    config.terminal.normalizeLineEndings
-  );
-  const [monitorTimestamp, setMonitorTimestamp] = useState(config.terminal.monitorTimestamp);
-  const [monitorAnsiFilter, setMonitorAnsiFilter] = useState(config.terminal.monitorAnsiFilter);
-  const [monitorTimeoutFraming, setMonitorTimeoutFraming] = useState(
-    config.terminal.monitorTimeoutFraming
-  );
-  const [monitorTimeoutMs, setMonitorTimeoutMs] = useState(config.terminal.monitorTimeoutMs);
 
   const [uiFontFamily, setUiFontFamily] = useState(config.app.uiFontFamily);
   const [language, setLanguage] = useState(config.app.language);
@@ -92,12 +82,6 @@ export const SettingsDialog: React.FC<SettingsDialogProps> = ({ isOpen, onClose 
     setCopyOnSelect(c.terminal.copyOnSelect);
     setRightClickPaste(c.terminal.rightClickPaste);
     setEnableWebLinks(c.terminal.enableWebLinks);
-    setDisplayMode(c.terminal.displayMode);
-    setNormalizeLineEndings(c.terminal.normalizeLineEndings);
-    setMonitorTimestamp(c.terminal.monitorTimestamp);
-    setMonitorAnsiFilter(c.terminal.monitorAnsiFilter);
-    setMonitorTimeoutFraming(c.terminal.monitorTimeoutFraming);
-    setMonitorTimeoutMs(c.terminal.monitorTimeoutMs);
     setUiFontFamily(c.app.uiFontFamily);
     setLanguage(c.app.language);
     setAutoUpdate(c.app.autoUpdate);
@@ -120,12 +104,6 @@ export const SettingsDialog: React.FC<SettingsDialogProps> = ({ isOpen, onClose 
       copyOnSelect,
       rightClickPaste,
       enableWebLinks,
-      displayMode,
-      normalizeLineEndings,
-      monitorTimestamp,
-      monitorAnsiFilter,
-      monitorTimeoutFraming,
-      monitorTimeoutMs,
     });
     updateConfig('app', {
       ...config.app,
@@ -482,50 +460,6 @@ export const SettingsDialog: React.FC<SettingsDialogProps> = ({ isOpen, onClose 
                 min={1}
                 max={100}
               />
-            </div>
-            <div className="border-t border-border/60 pt-3 mt-1">
-              <SectionTitle title={t('dialogs.settings.displayModeTitle')} />
-              <Select
-                label={t('dialogs.settings.displayMode')}
-                value={displayMode}
-                onChange={(v: string) => setDisplayMode(v as 'terminal' | 'monitor')}
-                options={[
-                  { value: 'terminal', label: t('dialogs.settings.displayModeTerminal') },
-                  { value: 'monitor', label: t('dialogs.settings.displayModeMonitor') },
-                ]}
-              />
-              <Toggle
-                label={t('dialogs.settings.normalizeLineEndings')}
-                hint={t('dialogs.settings.normalizeHint')}
-                checked={normalizeLineEndings}
-                onChange={setNormalizeLineEndings}
-              />
-              <Toggle
-                label={t('dialogs.settings.monitorTimestamp')}
-                checked={monitorTimestamp}
-                onChange={setMonitorTimestamp}
-              />
-              <Toggle
-                label={t('dialogs.settings.monitorAnsiFilter')}
-                hint={t('dialogs.settings.monitorAnsiHint')}
-                checked={monitorAnsiFilter}
-                onChange={setMonitorAnsiFilter}
-              />
-              <Toggle
-                label={t('dialogs.settings.monitorTimeoutFraming')}
-                hint={t('dialogs.settings.monitorTimeoutHint')}
-                checked={monitorTimeoutFraming}
-                onChange={setMonitorTimeoutFraming}
-              />
-              {monitorTimeoutFraming && (
-                <NumberInput
-                  label={t('dialogs.settings.monitorTimeoutMs')}
-                  value={monitorTimeoutMs}
-                  onChange={setMonitorTimeoutMs}
-                  min={10}
-                  max={2000}
-                />
-              )}
             </div>
           </div>
         );

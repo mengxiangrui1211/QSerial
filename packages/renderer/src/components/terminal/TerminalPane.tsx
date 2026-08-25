@@ -37,48 +37,6 @@ interface TerminalPaneProps {
   activeTabId?: string | null;
 }
 
-/**
- * 字节级换行归一化（UTF-8 安全）：把裸 LF / 裸 CR 归一为 CRLF，保留已有的 CRLF。
- * 直接消除「阶梯式」错位——这是 VT100 终端遇到裸 \n 时列号不前移导致的固有行为。
- * 仅在字节层面操作，绝不解码 UTF-8，因此不会破坏多字节字符。
- */
-function normalizeCrlf(bytes: Uint8Array): Uint8Array {
-  const out: number[] = [];
-  let prev = -1;
-  for (let i = 0; i < bytes.length; i++) {
-    const b = bytes[i];
-    if (b === 0x0d) {
-      // CR：若紧跟 LF 则原样保留 CRLF；否则补成 CRLF
-      if (bytes[i + 1] === 0x0a) {
-        out.push(0x0d, 0x0a);
-        i++;
-      } else {
-        out.push(0x0d, 0x0a);
-      }
-      prev = 0x0a;
-    } else if (b === 0x0a) {
-      // LF：若不是紧跟在 CR 后（即裸 LF），补成 CRLF
-      if (prev !== 0x0d) out.push(0x0d, 0x0a);
-      prev = 0x0a;
-    } else {
-      out.push(b);
-      prev = b;
-    }
-  }
-  return new Uint8Array(out);
-}
-
-/**
- * 过滤 ANSI 转义序列（CSI 序列 + 常见单/双字符转义），避免彩色日志在监控视图里变成乱码符号。
- */
-function stripAnsi(s: string): string {
-  return s
-    .replace(/\x1b\[[0-9;?]*[ -/]*[@-~]/g, '')
-    .replace(/\x1b[()][AB0-2]/g, '')
-    .replace(/\x1b[=>]/g, '')
-    .replace(/\x1b[78]/g, '');
-}
-
 export const TerminalPane: React.FC<TerminalPaneProps> = React.memo(
   ({ sessionId, connectionId, isActive, activeTabId }) => {
     const { t } = useTranslation();
@@ -113,20 +71,6 @@ export const TerminalPane: React.FC<TerminalPaneProps> = React.memo(
     const timeoutIdsRef = useRef<ReturnType<typeof setTimeout>[]>([]);
     const mountCountRef = useRef(0);
 
-    // ── 串口监控视图（monitor 模式）相关 ──
-    const monitorRef = useRef<HTMLDivElement>(null);
-    const monitorTextRef = useRef('');
-    const monitorFlushScheduledRef = useRef(false);
-    const monitorAutoScrollRef = useRef(true);
-    const lastPacketTimeRef = useRef(0);
-    const monitorOptsRef = useRef({
-      showTimestamp: config.terminal.monitorTimestamp,
-      ansiFilter: config.terminal.monitorAnsiFilter,
-      timeoutFraming: config.terminal.monitorTimeoutFraming,
-      timeoutMs: config.terminal.monitorTimeoutMs,
-    });
-    const normalizeRef = useRef(config.terminal.normalizeLineEndings);
-
     // 使用 selector 精准订阅，避免其他 session 变更导致本组件重渲染
     const session = useTerminalStore((state) => state.sessions[sessionId]);
     const updateSessionSize = useTerminalStore((state) => state.updateSessionSize);
@@ -135,7 +79,6 @@ export const TerminalPane: React.FC<TerminalPaneProps> = React.memo(
     const stopLog = useTerminalStore((state) => state.stopLog);
     const { currentTheme } = useThemeStore();
     const { config } = useConfigStore();
-    const displayMode = config.terminal.displayMode;
 
     // 调整终端尺寸 - 使用 FitAddon
     const resizeTerminal = useCallback(() => {
@@ -151,73 +94,6 @@ export const TerminalPane: React.FC<TerminalPaneProps> = React.memo(
       }
     }, [connectionId, sessionId, updateSessionSize]);
 
-    // 监控视图：按 rAF 批量刷新文本区（避免高频写入卡顿）
-    const scheduleMonitorFlush = useCallback(() => {
-      if (monitorFlushScheduledRef.current) return;
-      monitorFlushScheduledRef.current = true;
-      requestAnimationFrame(() => {
-        monitorFlushScheduledRef.current = false;
-        const mon = monitorRef.current;
-        if (!mon) return;
-        mon.textContent = monitorTextRef.current;
-        if (monitorAutoScrollRef.current) mon.scrollTop = mon.scrollHeight;
-      });
-    }, []);
-
-    // 监控视图：把一批字节追加到缓冲（含 ANSI 过滤 / 超时分帧 / 时间戳）
-    const appendToMonitor = useCallback(
-      (data: Uint8Array) => {
-        const opts = monitorOptsRef.current;
-        let text: string;
-        try {
-          text = new TextDecoder('utf-8', { fatal: false }).decode(data);
-        } catch {
-          text = '';
-        }
-        if (opts.ansiFilter) text = stripAnsi(text);
-        if (opts.timeoutFraming) {
-          const now = Date.now();
-          if (
-            lastPacketTimeRef.current !== 0 &&
-            now - lastPacketTimeRef.current > opts.timeoutMs &&
-            monitorTextRef.current.length > 0
-          ) {
-            monitorTextRef.current += '\n';
-          }
-          lastPacketTimeRef.current = now;
-        }
-        if (opts.showTimestamp) {
-          const d = new Date();
-          const ms = String(d.getMilliseconds()).padStart(3, '0');
-          monitorTextRef.current += `[${d.toLocaleTimeString('zh-CN', { hour12: false })}.${ms}] `;
-        }
-        monitorTextRef.current += text;
-        // 限制缓冲长度，避免内存无限增长（类似 scrollback）
-        const MAX = 200000;
-        if (monitorTextRef.current.length > MAX) {
-          monitorTextRef.current = monitorTextRef.current.slice(
-            monitorTextRef.current.length - MAX
-          );
-        }
-        scheduleMonitorFlush();
-      },
-      [scheduleMonitorFlush]
-    );
-
-    const appendToMonitorStatus = useCallback(
-      (msg: string) => {
-        monitorTextRef.current += `\n${msg}\n`;
-        scheduleMonitorFlush();
-      },
-      [scheduleMonitorFlush]
-    );
-
-    const handleMonitorScroll = useCallback(() => {
-      const mon = monitorRef.current;
-      if (!mon) return;
-      monitorAutoScrollRef.current = mon.scrollHeight - mon.scrollTop - mon.clientHeight < 40;
-    }, []);
-
     // 初始化终端（只执行一次，组件卸载时才销毁）
     useEffect(() => {
       // 防止重复初始化
@@ -228,59 +104,6 @@ export const TerminalPane: React.FC<TerminalPaneProps> = React.memo(
       disposedRef.current = false;
       mountCountRef.current += 1;
       const mountId = mountCountRef.current;
-
-      // ── 监控视图模式：不创建 xterm，直接把串口数据写入 pre-wrap 文本区 ──
-      if (displayMode === 'monitor') {
-        const unsubData = window.qserial.connection.onData(
-          connectionId,
-          (base64Data: string) => {
-            if (disposedRef.current) return;
-            try {
-              const data = base64ToUint8Array(base64Data);
-              appendToMonitor(data);
-              const currentSession = useTerminalStore.getState().sessions[sessionId];
-              if (currentSession?.logEnabled && currentSession?.logFilePath) {
-                const text = new TextDecoder().decode(data);
-                window.qserial.log.write(sessionId, text).catch(() => {});
-              }
-            } catch (error) {
-              console.error('Failed to append monitor data:', error);
-            }
-          }
-        );
-        unsubscribersRef.current.push(unsubData);
-
-        const unsubState = window.qserial.connection.onStateChange(
-          connectionId,
-          (state: string) => {
-            if (disposedRef.current) return;
-            updateSessionState(sessionId, state as ConnectionState);
-            if (state === 'connected') {
-              appendToMonitorStatus(t('terminalPane.monitorConnected'));
-            } else if (state === 'disconnected') {
-              appendToMonitorStatus(t('terminalPane.monitorDisconnected'));
-            }
-          }
-        );
-        unsubscribersRef.current.push(unsubState);
-
-        const unsubError = window.qserial.connection.onError(connectionId, (error: string) => {
-          appendToMonitorStatus(`${t('terminalPane.error')}: ${error}`);
-        });
-        unsubscribersRef.current.push(unsubError);
-
-        return () => {
-          console.log('[TerminalPane] DISPOSE monitor mountId:', mountId);
-          disposedRef.current = true;
-          unsubscribersRef.current.forEach((u) => u());
-          unsubscribersRef.current = [];
-          monitorTextRef.current = '';
-          lastPacketTimeRef.current = 0;
-          if (monitorRef.current) monitorRef.current.textContent = '';
-          initializedRef.current = false;
-        };
-      }
-
       const openedRef = { current: false }; // 追踪 xterm.open() 是否已调用
       console.log(
         '[TerminalPane] INIT xterm mountId:',
@@ -612,9 +435,8 @@ export const TerminalPane: React.FC<TerminalPaneProps> = React.memo(
           if (disposedRef.current) return;
           try {
             const data = base64ToUint8Array(base64Data);
-            // 换行归一化（默认开）：消除裸 LF/CR 导致的阶梯错位，UTF-8 安全
-            const toWrite = normalizeRef.current ? normalizeCrlf(data) : data;
-            xterm.write(toWrite);
+            // 直接写入 Uint8Array，避免 TextDecoder 对非 UTF-8 数据解码产生无效字符
+            xterm.write(data);
 
             // 实时写入日志（日志需要文本）
             const currentSession = useTerminalStore.getState().sessions[sessionId];
@@ -715,7 +537,7 @@ export const TerminalPane: React.FC<TerminalPaneProps> = React.memo(
         initializedRef.current = false;
       };
       // eslint-disable-next-line react-hooks/exhaustive-deps
-    }, [connectionId, sessionId, displayMode]);
+    }, [connectionId, sessionId]);
 
     // 主题和配置变化
     useEffect(() => {
@@ -725,17 +547,6 @@ export const TerminalPane: React.FC<TerminalPaneProps> = React.memo(
         xtermRef.current.options.fontSize = config.terminal.fontSize;
       }
     }, [currentTheme, config.terminal.fontFamily, config.terminal.fontSize]);
-
-    // 同步显示相关配置到 ref，供 onData 闭包实时读取（避免 stale）
-    useEffect(() => {
-      normalizeRef.current = config.terminal.normalizeLineEndings;
-      monitorOptsRef.current = {
-        showTimestamp: config.terminal.monitorTimestamp,
-        ansiFilter: config.terminal.monitorAnsiFilter,
-        timeoutFraming: config.terminal.monitorTimeoutFraming,
-        timeoutMs: config.terminal.monitorTimeoutMs,
-      };
-    }, [config]);
 
     // 激活时聚焦和调整尺寸
     useEffect(() => {
@@ -1012,6 +823,8 @@ export const TerminalPane: React.FC<TerminalPaneProps> = React.memo(
 
     return (
       <div
+        ref={containerRef}
+        className="terminal-container"
         style={{
           position: 'absolute',
           top: 0,
@@ -1020,45 +833,10 @@ export const TerminalPane: React.FC<TerminalPaneProps> = React.memo(
           bottom: 0,
           visibility: isActive ? 'visible' : 'hidden',
         }}
+        onContextMenu={(e) => {
+          e.preventDefault();
+        }}
       >
-        {displayMode === 'monitor' ? (
-          <div
-            ref={monitorRef}
-            className="monitor-view"
-            onScroll={handleMonitorScroll}
-            style={{
-              position: 'absolute',
-              top: 0,
-              left: 0,
-              right: 0,
-              bottom: 0,
-              overflow: 'auto',
-              whiteSpace: 'pre-wrap',
-              wordBreak: 'break-all',
-              padding: '8px 10px',
-              fontFamily: config.terminal.fontFamily,
-              fontSize: config.terminal.fontSize,
-              lineHeight: 1.45,
-              color: 'var(--color-text)',
-              background: 'var(--color-bg)',
-            }}
-          />
-        ) : (
-          <div
-            ref={containerRef}
-            className="terminal-container"
-            style={{
-              position: 'absolute',
-              top: 0,
-              left: 0,
-              right: 0,
-              bottom: 0,
-              visibility: isActive ? 'visible' : 'hidden',
-            }}
-            onContextMenu={(e) => {
-              e.preventDefault();
-            }}
-          >
         {/* 控制按钮组 */}
         {isActive && (
           <div className="absolute top-2 right-2 z-10 flex gap-2">
@@ -1535,8 +1313,6 @@ export const TerminalPane: React.FC<TerminalPaneProps> = React.memo(
           onClose={() => setShowSerialShareDialog(false)}
           defaultSessionId={sessionId}
         />
-          </div>
-        )}
       </div>
     );
   }
