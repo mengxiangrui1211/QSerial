@@ -69,6 +69,110 @@ function normalizeLineEndings(bytes: Uint8Array): Uint8Array {
   return out;
 }
 
+/**
+ * 生成当前本地时间的时间戳字节，格式 [HH:MM:SS.mmm]，灰色 ANSI + 空格。
+ * 仅含 ASCII，TextEncoder 安全，不会破坏后续多字节数据。
+ */
+function timestampBytes(): Uint8Array {
+  const d = new Date();
+  const pad = (n: number, len = 2) => String(n).padStart(len, '0');
+  const text = `\x1b[90m[${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}.${pad(d.getMilliseconds(), 3)}]\x1b[0m `;
+  return new TextEncoder().encode(text);
+}
+
+/**
+ * 在每一行行首插入时间戳。
+ * @param lineStartRef 跨包维护「是否处于行首」状态：上一包以 \r\n 结尾则下一包开头为行首。
+ * 字节级处理，不解码文本；ANSI 转义不占打印宽度，仅作视觉修饰。
+ */
+function insertTimestamps(bytes: Uint8Array, lineStartRef: { current: boolean }): Uint8Array {
+  const ts = timestampBytes();
+  const out: number[] = [];
+  let needTs = lineStartRef.current;
+  let i = 0;
+  while (i < bytes.length) {
+    if (needTs) {
+      for (let k = 0; k < ts.length; k++) out.push(ts[k]);
+      needTs = false;
+    }
+    if (bytes[i] === 0x0d && i + 1 < bytes.length && bytes[i + 1] === 0x0a) {
+      out.push(0x0d, 0x0a);
+      i += 2;
+      needTs = true; // 下一行首需要时间戳
+    } else {
+      out.push(bytes[i]);
+      i++;
+    }
+  }
+  lineStartRef.current = needTs;
+  return new Uint8Array(out);
+}
+
+// AT 结果码字节标记
+const RC_OK = [0x4f, 0x4b]; // "OK"
+const RC_ERROR = [0x45, 0x52, 0x52, 0x4f, 0x52]; // "ERROR"
+const RC_CME = [0x2b, 0x43, 0x4d, 0x45, 0x20, 0x45, 0x52, 0x52, 0x4f, 0x52]; // "+CME ERROR"
+const RC_CMS = [0x2b, 0x43, 0x4d, 0x53, 0x20, 0x45, 0x52, 0x52, 0x4f, 0x52]; // "+CMS ERROR"
+
+function bytesEndsWith(haystack: Uint8Array, suffix: number[]): boolean {
+  if (haystack.length < suffix.length) return false;
+  for (let k = 0; k < suffix.length; k++) {
+    if (haystack[haystack.length - suffix.length + k] !== suffix[k]) return false;
+  }
+  return true;
+}
+
+function bytesContains(haystack: Uint8Array, needle: number[]): boolean {
+  if (haystack.length < needle.length) return false;
+  for (let s = 0; s <= haystack.length - needle.length; s++) {
+    let ok = true;
+    for (let k = 0; k < needle.length; k++) {
+      if (haystack[s + k] !== needle[k]) {
+        ok = false;
+        break;
+      }
+    }
+    if (ok) return true;
+  }
+  return false;
+}
+
+/** 判断一行（不含结尾 \r\n）是否为 AT 结果码行，需要在其后补空行 */
+function isResultCodeLine(line: Uint8Array): boolean {
+  return (
+    bytesEndsWith(line, RC_OK) ||
+    bytesEndsWith(line, RC_ERROR) ||
+    bytesContains(line, RC_CME) ||
+    bytesContains(line, RC_CMS)
+  );
+}
+
+/**
+ * AT 事务分块：在结果码行（OK / ERROR / +CME ERROR / +CMS ERROR）后的 \r\n 之后
+ * 再补一个 \r\n（空行），让每次 AT 查询独立成块。
+ * 字节级处理，不解码文本；对不含这些结果码的二进制流无影响（不会插入多余空行）。
+ */
+function insertBlockSpacing(bytes: Uint8Array): Uint8Array {
+  const out: number[] = [];
+  let lineStart = 0;
+  let i = 0;
+  while (i < bytes.length) {
+    if (bytes[i] === 0x0d && i + 1 < bytes.length && bytes[i + 1] === 0x0a) {
+      out.push(0x0d, 0x0a);
+      const line = bytes.subarray(lineStart, i);
+      if (isResultCodeLine(line)) {
+        out.push(0x0d, 0x0a); // 补空行
+      }
+      i += 2;
+      lineStart = i;
+    } else {
+      out.push(bytes[i]);
+      i++;
+    }
+  }
+  return new Uint8Array(out);
+}
+
 interface TerminalPaneProps {
   sessionId: string;
   connectionId: string;
@@ -118,6 +222,8 @@ export const TerminalPane: React.FC<TerminalPaneProps> = React.memo(
     const stopLog = useTerminalStore((state) => state.stopLog);
     const { currentTheme } = useThemeStore();
     const { config } = useConfigStore();
+    // 跨包维护「是否处于行首」状态，供时间戳插入判断（上一包以 \r\n 结尾则新包为行首）
+    const tsLineStartRef = useRef(true);
 
     // 调整终端尺寸 - 使用 FitAddon
     const resizeTerminal = useCallback(() => {
@@ -473,9 +579,16 @@ export const TerminalPane: React.FC<TerminalPaneProps> = React.memo(
           // 终端已销毁时不再写入数据，防止触发 xterm 内部异步回调链崩溃
           if (disposedRef.current) return;
           try {
-            const data = base64ToUint8Array(base64Data);
+            const raw = base64ToUint8Array(base64Data);
             // 换行归一化：裸 LF/CR → CRLF，消除阶梯式错位（UTF-8 安全，不解码原始字节）
-            xterm.write(normalizeLineEndings(data));
+            let out = normalizeLineEndings(raw);
+            // 读取最新配置（避免 onData 闭包捕获旧 config）
+            const cfg = useConfigStore.getState();
+            // AT 事务分块：结果码行后补空行，让每次查询独立成块
+            if (cfg.terminal.atBlockSplit) out = insertBlockSpacing(out);
+            // 接收时间戳：每行行首加 [HH:MM:SS.mmm]
+            if (cfg.serial.showTimestamp) out = insertTimestamps(out, tsLineStartRef);
+            xterm.write(out);
 
             // 实时写入日志（日志需要文本）
             const currentSession = useTerminalStore.getState().sessions[sessionId];
