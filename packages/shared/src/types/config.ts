@@ -43,12 +43,6 @@ export interface TerminalSettings {
   autoReconnect: boolean;
   reconnectInterval: number;
   reconnectAttempts: number;
-  /**
-   * AT 事务分块：收到 OK / ERROR / +CME ERROR / +CMS ERROR 等结果码后补一个空行，
-   * 让每次 AT 查询（命令 + 响应 + 结果码）成为独立块，便于阅读。
-   * 仅在终端模式下、且数据为 AT 文本流时生效，不影响二进制帧。
-   */
-  atBlockSplit: boolean;
 }
 
 /**
@@ -136,7 +130,6 @@ export const DEFAULT_CONFIG: AppConfig = {
     autoReconnect: true,
     reconnectInterval: 3000,
     reconnectAttempts: 5,
-    atBlockSplit: true,
   },
 
   serial: {
@@ -147,7 +140,7 @@ export const DEFAULT_CONFIG: AppConfig = {
     autoReconnect: true,
     reconnectInterval: 3000,
     reconnectAttempts: 5,
-    showTimestamp: true,
+    showTimestamp: false,
     hexDisplay: false,
   },
 

@@ -59,8 +59,6 @@ export const SettingsDialog: React.FC<SettingsDialogProps> = ({ isOpen, onClose 
   const [copyOnSelect, setCopyOnSelect] = useState(config.terminal.copyOnSelect);
   const [rightClickPaste, setRightClickPaste] = useState(config.terminal.rightClickPaste);
   const [enableWebLinks, setEnableWebLinks] = useState(config.terminal.enableWebLinks);
-  const [atBlockSplit, setAtBlockSplit] = useState(config.terminal.atBlockSplit);
-  const [showTimestamp, setShowTimestamp] = useState(config.serial.showTimestamp);
 
   const [uiFontFamily, setUiFontFamily] = useState(config.app.uiFontFamily);
   const [language, setLanguage] = useState(config.app.language);
@@ -84,8 +82,6 @@ export const SettingsDialog: React.FC<SettingsDialogProps> = ({ isOpen, onClose 
     setCopyOnSelect(c.terminal.copyOnSelect);
     setRightClickPaste(c.terminal.rightClickPaste);
     setEnableWebLinks(c.terminal.enableWebLinks);
-    setAtBlockSplit(c.terminal.atBlockSplit);
-    setShowTimestamp(c.serial.showTimestamp);
     setUiFontFamily(c.app.uiFontFamily);
     setLanguage(c.app.language);
     setAutoUpdate(c.app.autoUpdate);
@@ -108,11 +104,6 @@ export const SettingsDialog: React.FC<SettingsDialogProps> = ({ isOpen, onClose 
       copyOnSelect,
       rightClickPaste,
       enableWebLinks,
-      atBlockSplit,
-    });
-    updateConfig('serial', {
-      ...config.serial,
-      showTimestamp,
     });
     updateConfig('app', {
       ...config.app,
@@ -437,18 +428,6 @@ export const SettingsDialog: React.FC<SettingsDialogProps> = ({ isOpen, onClose 
               hint={t('dialogs.settings.linksHint')}
               checked={enableWebLinks}
               onChange={setEnableWebLinks}
-            />
-            <Toggle
-              label={t('dialogs.settings.atBlockSplit')}
-              hint={t('dialogs.settings.atBlockSplitHint')}
-              checked={atBlockSplit}
-              onChange={setAtBlockSplit}
-            />
-            <Toggle
-              label={t('dialogs.settings.showTimestamp')}
-              hint={t('dialogs.settings.showTimestampHint')}
-              checked={showTimestamp}
-              onChange={setShowTimestamp}
             />
             <Select
               label={t('dialogs.settings.bell')}
